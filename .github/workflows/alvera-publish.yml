@@ -53,6 +53,10 @@ jobs:
           context: .
           file: ./Dockerfile
           push: true
+          # Both, not just the runner's. Omitting this publishes amd64 only,
+          # and every developer machine here is arm64 — the pull fails with
+          # "no matching manifest", which reads like a missing tag.
+          platforms: linux/amd64,linux/arm64
           tags: |
             ${{ env.IMAGE }}:${{ steps.v.outputs.version }}-sns-log
             ${{ env.IMAGE }}:alvera
