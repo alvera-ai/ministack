@@ -134,7 +134,7 @@ _platform_endpoints = AccountRegionScopedDict()
 # (/_ministack/ses/messages, /_ministack/sqs/messages); SNS was the one
 # messaging service that logged a line and stored nothing, so an SMS was the
 # only thing you could send and not observe. Served by app.py at
-# /_ministack/sns/sms-messages and at LocalStack's /_aws/sns/sms-messages.
+# /_ministack/sns/sms-messages.
 _sms_messages = AccountRegionScopedDict()
 
 

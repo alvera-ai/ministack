@@ -1110,7 +1110,7 @@ async def _handle_sqs_messages_request(method: str, path: str, headers: dict, qu
     return 200, {"Content-Type": "application/json"}, json.dumps(response).encode()
 
 
-_SNS_SMS_PATHS = ("/_ministack/sns/sms-messages", "/_aws/sns/sms-messages")
+_SNS_SMS_PATH = "/_ministack/sns/sms-messages"
 
 
 async def _handle_sns_sms_messages_request(method: str, path: str, headers: dict, query_params: dict):
@@ -1121,11 +1121,12 @@ async def _handle_sns_sms_messages_request(method: str, path: str, headers: dict
     read-only introspection as `/_ministack/ses/messages` and
     `/_ministack/sqs/messages`.
 
-    Also answered at LocalStack's `/_aws/sns/sms-messages`, in LocalStack's
-    `{"sms_messages": {"<phone>": [...]}, "region": "<region>"}` shape, for the
-    same reason `/_localstack/health` is answered alongside
-    `/_ministack/health`: a suite that asserts an SMS was sent should not have
-    to be rewritten to run here.
+    The body keeps LocalStack's shape —
+    `{"sms_messages": {"<phone>": [...]}, "region": "<region>"}` — so a suite
+    moving here changes the URL and nothing else. Only the native
+    `/_ministack/` path serves it: the compatibility surface stays narrow, and
+    a `/_aws/` alias earns its place only against a concrete migration that
+    would otherwise be painful.
 
     Filters:
       ?account=<12-digit-id>   restrict to one account
@@ -1133,7 +1134,7 @@ async def _handle_sns_sms_messages_request(method: str, path: str, headers: dict
       ?phoneNumber=<e164>      restrict to one recipient; the key is present
                                with an empty list when nothing was sent to it
     """
-    if path not in _SNS_SMS_PATHS or method != "GET":
+    if path != _SNS_SMS_PATH or method != "GET":
         return None
 
     account_id = None

@@ -136,9 +136,9 @@ Also compatible with LocalStack's health and SMS-log endpoints:
 curl http://localhost:4566/_localstack/health
 curl http://localhost:4566/health
 
-# Same body as /_ministack/sns/sms-messages, in LocalStack's
+# Direct-to-phone SNS publishes, in LocalStack's
 # {"sms_messages": {"<phone>": [...]}, "region": "<region>"} shape
-curl http://localhost:4566/_aws/sns/sms-messages
+curl http://localhost:4566/_ministack/sns/sms-messages
 ```
 
 ---
