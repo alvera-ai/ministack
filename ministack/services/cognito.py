@@ -6536,6 +6536,7 @@ def _get_credentials_for_identity(data):
 
     access_key = f"ASIA{''.join(secrets.choice(string.ascii_uppercase + string.digits) for _ in range(16))}"
     secret_key = base64.b64encode(secrets.token_bytes(30)).decode()
+    session_token = base64.b64encode(secrets.token_bytes(64)).decode()
     role_id = "AROA" + new_uuid().replace("-", "")[:17].upper()
 
     # The cognito* identity fields API Gateway reports for IAM-authorized
@@ -6568,7 +6569,10 @@ def _get_credentials_for_identity(data):
                 f"{role_name}/CognitoIdentityCredentials"),
         "UserId": f"{role_id}:CognitoIdentityCredentials",
         "SecretAccessKey": secret_key,
+        "SessionToken": session_token,
         "Expiration": now + 3600,
+        "AccountId": get_account_id(),
+        "PrincipalType": "AssumedRole",
         "_identity_id": identity_id,
         "_identity_pool_id": (pool or {}).get("IdentityPoolId", ""),
         "_logins": logins,
@@ -6582,7 +6586,7 @@ def _get_credentials_for_identity(data):
         "Credentials": {
             "AccessKeyId": access_key,
             "SecretKey": secret_key,
-            "SessionToken": base64.b64encode(secrets.token_bytes(64)).decode(),
+            "SessionToken": session_token,
             "Expiration": now + 3600,
         },
     })
@@ -6605,7 +6609,12 @@ def _set_identity_pool_roles(data):
     pool = _identity_pools.get(iid)
     if not pool:
         return error_response_json("ResourceNotFoundException", f"Identity pool {iid} not found.", 400)
+    # The call sets the whole configuration: RoleMappings is optional on the
+    # API reference and no call removes a mapping on its own, so an omitted
+    # member clears what was there. Reasoned from the API surface, not
+    # measured against a live account.
     pool["_roles"] = data.get("Roles", {})
+    pool["_role_mappings"] = data.get("RoleMappings", {})
     return json_response({})
 
 
@@ -6617,7 +6626,9 @@ def _get_identity_pool_roles(data):
     return json_response({
         "IdentityPoolId": iid,
         "Roles": pool.get("_roles", {}),
-        "RoleMappings": {},
+        # .get, not indexing: pools created before this field existed (and the
+        # ones the CloudFormation provisioner builds itself) carry no entry.
+        "RoleMappings": pool.get("_role_mappings", {}),
     })
 
 

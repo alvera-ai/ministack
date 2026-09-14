@@ -53,12 +53,13 @@ from ministack.core import container_reaper
 from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.concurrency import run_reentrant
 from ministack.core.lambda_runtime import (
+    DURABLE_ENV_VARS,
     INVOKE_DEPTH_BOOTSTRAP,
     INVOKE_DEPTH_ENV,
-    INVOKE_DEPTH_EVENT_KEY,
     INVOKE_DEPTH_HEADER,
     acquire_worker,
     ensure_spawned,
+    execution_credentials,
     invalidate_worker,
     reap_idle_workers,
     release_worker,
@@ -1307,11 +1308,7 @@ def _durable_env_overlay() -> dict[str, str]:
     ctx = _durable_ctx.get()
     if not ctx:
         return {}
-    return {
-        "AWS_LAMBDA_DURABLE_EXECUTION_ARN": ctx.get("arn", ""),
-        "AWS_LAMBDA_DURABLE_CHECKPOINT_TOKEN": ctx.get("token", ""),
-        "AWS_LAMBDA_DURABLE_EXECUTION_NAME": ctx.get("name", ""),
-    }
+    return {var: ctx.get(key, "") for var, key in DURABLE_ENV_VARS.items()}
 
 
 def invoke_durable_resume(function_name: str, durable_arn: str, original_event: dict) -> None:
@@ -4071,18 +4068,86 @@ def handler(event, context):
 '''
 
 _JS_CTX_ARN_SHIM = '''\
-// MiniStack shim: hand user code the control-plane ARN in its context.
+// MiniStack shim: hand user code the control-plane ARN in its context, and
+// reach the gateway over plain HTTP when a library insists on HTTPS.
 const path = require("path");
 const fs = require("fs");
+const http = require("http");
+const https = require("https");
 const REAL = process.env._MS_REAL_HANDLER || "index.handler";
 const ARN = process.env._LAMBDA_FUNCTION_ARN || "";
+const TASK_ROOT = process.env.LAMBDA_TASK_ROOT || "/var/task";
+// The container talks to MiniStack over http://<gateway host>:<port>, but the
+// response submitters the CDK bundles into its custom-resource handlers
+// (nodejs-entrypoint, the provider framework, AwsCustomResource) build the
+// ResponseURL PUT from the URL's hostname and path only and hand it to
+// https.request, so it goes out over TLS to port 443 whatever the URL says,
+// and a Node custom resource never signalled its stack. Downgrade https to
+// http for the gateway hosts only; the https default 443 becomes the gateway
+// port, any other explicit port is kept.
+try {
+  const EP = new URL(process.env.AWS_ENDPOINT_URL || "http://host.docker.internal:4566");
+  const EP_PORT = EP.port || (EP.protocol === "https:" ? "443" : "80");
+  const PLAIN_HOSTS = new Set(
+    [EP.hostname, "localhost", "127.0.0.1", "host.docker.internal"]
+      .concat((process.env._MS_GATEWAY_HOSTS || "").split(","))
+      .filter(Boolean));
+  const origHttpsRequest = https.request;
+  https.request = function (input, options, callback) {
+    // Keep the caller's own arguments for the pass-through below: Node's
+    // ClientRequest reads (input, options, cb) positionally and, for a
+    // non-string input, takes cb from the SECOND argument — so replaying a
+    // normalised (input, undefined, callback) would drop the callback and the
+    // handler would never see its response. A copy, not `arguments` itself:
+    // this file is not in strict mode, so `arguments` stays aliased to the
+    // parameters and the normalisation below would rewrite it too.
+    const original = Array.prototype.slice.call(arguments);
+    if (typeof options === "function") { callback = options; options = undefined; }
+    let opts;
+    if (typeof input === "string" || input instanceof URL) {
+      const u = new URL(String(input));
+      opts = Object.assign({ hostname: u.hostname, port: u.port, path: u.pathname + u.search,
+                             protocol: u.protocol }, options || {});
+    } else {
+      opts = Object.assign({}, input, options || {});
+    }
+    const host = opts.hostname || String(opts.host || "").split(":")[0];
+    const rawPort = opts.port ? String(opts.port) : "";
+    // Only the gateway hosts, and only the https default port or the gateway
+    // port itself: a handler that dials its own TLS sidecar on another port
+    // of localhost keeps TLS.
+    if (!PLAIN_HOSTS.has(host) || (rawPort && rawPort !== "443" && rawPort !== EP_PORT)) {
+      return origHttpsRequest.apply(https, original);
+    }
+    opts.protocol = "http:";
+    opts.hostname = host;
+    opts.host = host + ":" + EP_PORT;
+    opts.port = EP_PORT;
+    // Node's default http agent (keep-alive with an idle timeout) replaces
+    // whatever https agent the caller set.
+    opts.agent = undefined;
+    delete opts._defaultAgent;
+    return http.request(opts, callback);
+  };
+  https.get = function () {
+    // Same argument shapes as request(), forwarded untouched.
+    const req = https.request.apply(https, arguments);
+    req.end();
+    return req;
+  };
+  // A handler that did `import { request } from "node:https"` holds a live
+  // binding that only refreshes on request; refresh it now.
+  require("module").syncBuiltinESMExports();
+} catch (e) {
+  // A bad AWS_ENDPOINT_URL costs the downgrade, not the function.
+}
 const dot = REAL.lastIndexOf(".");
 const modPart = REAL.slice(0, dot);
 const fnName = REAL.slice(dot + 1);
 let cached = null;
 async function load() {
   if (cached) return cached;
-  const base = path.join("/var/task", modPart);
+  const base = path.join(TASK_ROOT, modPart);
   for (const ext of [".mjs", ".js", ".cjs"]) {
     const p = base + ext;
     if (fs.existsSync(p)) {
@@ -4133,8 +4198,12 @@ def _write_context_arn_shim(code_dir: str, runtime: str, handler: str) -> str | 
             pass
         return None
     try:
-        with open(shim_path, "w") as f:
+        # Another container of the same code may already hold the dir as a
+        # read-only mount; a rename lands the file whole rather than truncated.
+        tmp_path = f"{shim_path}.{os.getpid()}.tmp"
+        with open(tmp_path, "w") as f:
             f.write(source)
+        os.replace(tmp_path, shim_path)
     except OSError as exc:
         logger.warning("Lambda context-ARN shim not written (%s); "
                        "container will report the RIE default ARN", exc)
@@ -4203,9 +4272,6 @@ def _spawn_lambda_container_impl(config: dict, code_zip: bytes | None,
     container_env: dict[str, str] = {
         "AWS_DEFAULT_REGION": get_region(),
         "AWS_REGION": get_region(),
-        "AWS_ACCESS_KEY_ID": _account_region_from_function_config(config)[0],
-        "AWS_SECRET_ACCESS_KEY": os.environ.get("AWS_SECRET_ACCESS_KEY", "test"),
-        "AWS_SESSION_TOKEN": os.environ.get("AWS_SESSION_TOKEN", ""),
         "AWS_LAMBDA_FUNCTION_NAME": config["FunctionName"],
         "AWS_LAMBDA_FUNCTION_MEMORY_SIZE": str(config.get("MemorySize", 128)),
         "AWS_LAMBDA_FUNCTION_VERSION": config.get("Version", "$LATEST"),
@@ -4213,6 +4279,7 @@ def _spawn_lambda_container_impl(config: dict, code_zip: bytes | None,
         "_LAMBDA_FUNCTION_ARN": config.get("FunctionArn", ""),
         "_LAMBDA_TIMEOUT": str(timeout),
     }
+    container_env.update(execution_credentials(config))
     if is_provided:
         container_env["LAMBDA_TASK_ROOT"] = "/var/task"
     container_env["_HANDLER"] = handler
@@ -4264,6 +4331,11 @@ def _spawn_lambda_container_impl(config: dict, code_zip: bytes | None,
         # Rewrite localhost/127.0.0.1 → host.docker.internal for container access
         endpoint = _rewrite_host_for_container(endpoint)
     container_env["AWS_ENDPOINT_URL"] = endpoint
+    # The host MiniStack advertises for itself (custom-resource ResponseURLs
+    # carry it); the Node shim downgrades https to http for it.
+    advertised_host = os.environ.get("MINISTACK_HOST", "").split(":")[0]
+    if advertised_host:
+        container_env["_MS_GATEWAY_HOSTS"] = advertised_host
 
     # Mounts (Zip only — Image bakes code in). Layers are NEVER bind-mounted:
     # AWS merges every layer's contents into /opt (so /opt/python, /opt/lib,
@@ -4837,18 +4909,19 @@ def _execute_function_dispatch(func: dict, config: dict, event: dict,
     else:
         runtime = config.get("Runtime", "python3.12")
         if runtime.startswith("provided"):
-            result = _execute_function_provided(func, event)
-        elif (runtime.startswith("python") or runtime.startswith("nodejs")) \
-                and not _durable_ctx.get():
-            # Warm pool reuses worker subprocesses whose env was fixed at
-            # spawn time. Durable invocations need per-call env (the
-            # DurableExecutionArn + CheckpointToken change every invoke),
-            # so route them through the per-call local executor.
-            result = _execute_function_warm(func, event)
+            # A durable invocation needs a per-call environment (the
+            # DurableExecutionArn and CheckpointToken change every invoke) and a
+            # pooled worker's env is fixed at spawn, so provided.* durable
+            # invocations keep the one-shot executor. python and nodejs carry
+            # that context in the event instead, which is why they can be pooled.
+            if _durable_ctx.get():
+                result = _execute_function_provided(func, event)
+            else:
+                result = _execute_function_provided_warm(func, event, request_id)
         elif runtime.startswith(("python", "nodejs")):
-            # Durable python/nodejs falls through to local subprocess (per
-            # the elif above we already filtered durable out of warm).
-            result = _execute_function_local(func, event)
+            # Durable invocations included: their per-call context rides in
+            # the event, so the pooled worker can serve them.
+            result = _execute_function_warm(func, event)
         else:
             # java*/dotnet*/ruby* need the real RIE image — there's no
             # in-process executor that can run JVM bytecode or .NET IL.
@@ -5013,17 +5086,19 @@ def _execute_function_warm(func: dict, event: dict) -> dict:
         # can set ``_X_AMZN_TRACE_ID`` in os.environ before calling the
         # handler. Per-invocation, not bake-time, so it can't live in the
         # worker's spawn env.
-        _xray = _xray_trace_id_for_invocation(config)
-        if _xray:
-            event["_x_amzn_trace_id"] = _xray
-        # Same channel for the recursive-loop depth: the worker's env is
-        # fixed at spawn time, so it has to ride in the event. Both worker
-        # bootstraps move it to the environment and drop the key before the
-        # handler runs. Non-dict payloads have nowhere to carry it, and lose
-        # the counter.
-        if isinstance(event, dict):
-            event[INVOKE_DEPTH_EVENT_KEY] = _invoke_depth.get()
-        result = worker.invoke(event, new_uuid())
+        # The per-invocation values travel beside the payload, never inside
+        # it: on AWS the trace header is a reserved environment variable that
+        # "changes with each invocation", the request id is on the context
+        # object, and the payload the handler receives is the caller's, of
+        # whatever JSON type. A pooled worker's spawn environment is fixed, so
+        # the values ride the envelope and the bootstrap applies them per call.
+        result = worker.invoke(
+            event,
+            new_uuid(),
+            trace_id=_xray_trace_id_for_invocation(config),
+            depth=_invoke_depth.get(),
+            durable=_durable_env_overlay(),
+        )
         if result.get("status") == "ok":
             return {"body": result.get("result"), "log": result.get("log", "")}
         else:
@@ -5052,6 +5127,102 @@ def _execute_function_warm(func: dict, event: dict) -> dict:
         release_worker(worker)
 
 
+def _provided_worker_env(config: dict, code_dir: str, port: int) -> dict:
+    """Build the process environment for a ``provided.*`` bootstrap binary.
+
+    Shared by the one-shot executor and the warm ``ProvidedWorker`` so the two
+    paths cannot drift. Per-invocation values (X-Ray trace ID) are deliberately
+    absent: a reused environment cannot carry them in env, and the Runtime API
+    has headers for exactly that. The one-shot executor adds its per-call
+    overlays after calling this helper. Custom runtimes have no Python/Node
+    shim to propagate MiniStack's per-call recursion depth; the one-shot path
+    retains its legacy spawn-time depth overlay instead of freezing it here.
+    """
+    env_vars = _runtime_env_vars(config)
+    proc_env = dict(os.environ)
+    proc_env.update({
+        "AWS_LAMBDA_RUNTIME_API": f"127.0.0.1:{port}",
+        "AWS_DEFAULT_REGION": get_region(),
+        "AWS_REGION": get_region(),
+        "AWS_LAMBDA_FUNCTION_NAME": config.get("FunctionName", "unknown"),
+        "AWS_LAMBDA_FUNCTION_MEMORY_SIZE": str(config.get("MemorySize", 128)),
+        "AWS_LAMBDA_FUNCTION_VERSION": config.get("Version", "$LATEST"),
+        "AWS_LAMBDA_LOG_STREAM_NAME": new_uuid(),
+        "LAMBDA_TASK_ROOT": code_dir,
+        "_HANDLER": config.get("Handler", "bootstrap"),
+    })
+    proc_env.update(execution_credentials(config))
+    proc_env.update(env_vars)
+    proc_env.update(_durable_env_overlay())
+    # Override AWS_ENDPOINT_URL *after* function env vars so Lambda binaries
+    # always call back to this MiniStack instance.
+    endpoint = os.environ.get("AWS_ENDPOINT_URL", "")
+    if not endpoint:
+        hostname = os.environ.get("LOCALSTACK_HOSTNAME", "")
+        if hostname:
+            endpoint = _normalize_endpoint_url(hostname)
+    if endpoint:
+        proc_env["AWS_ENDPOINT_URL"] = endpoint
+    return proc_env
+
+
+def _execute_function_provided_warm(func: dict, event: dict,
+                                    request_id: str | None = None) -> dict:
+    """Execute a ``provided.*`` Lambda on a pooled, reused environment."""
+    config = func.get("config") or func
+    code_zip = func.get("code_zip")
+    if not code_zip:
+        return {"body": {"statusCode": 200, "body": "Mock response - no code deployed"}}
+
+    func_name = config.get("FunctionName", "unknown")
+    qualifier = config.get("Version", "$LATEST")
+    _ensure_reaper_thread()
+    worker, reason = acquire_worker(func_name, config, code_zip, qualifier=qualifier)
+    if worker is None and reason == "func_cap":
+        return _throttle_response(
+            reason_code="ReservedFunctionConcurrentInvocationLimitExceeded",
+            msg=f"Rate Exceeded: function {func_name} warm-worker ceiling reached",
+        )
+    try:
+        # Invocation metadata belongs in Runtime API headers, not in the user
+        # payload (which need not be a dict and may contain similarly named keys).
+        result = worker.invoke(
+            event, request_id or new_uuid(),
+            trace_id=_xray_trace_id_for_invocation(config),
+        )
+        if result.get("status") == "ok":
+            return {"body": result.get("result"), "log": result.get("log", "")}
+        payload = result.get("error_payload")
+        if isinstance(payload, dict):
+            return {"body": payload, "error": True, "log": result.get("log", "")}
+        error_msg = result.get("error", "Unknown error")
+        error_type = ("Runtime.ExitError" if "timed out" in error_msg.lower()
+                      else "Runtime.HandlerError")
+        return {
+            "body": {"errorMessage": error_msg, "errorType": error_type},
+            "error": True,
+            "log": result.get("log", ""),
+        }
+    except Exception as e:
+        logger.error("Warm provided-runtime execution error for %s: %s", func_name, e)
+        account, region = _account_region_from_function_config(config)
+        invalidate_worker(func_name, qualifier=qualifier, account=account, region=region)
+        worker = None  # invalidation already removed and reaped the worker
+        # A Python class name is not an AWS error type: a bootstrap that is
+        # missing or cannot be executed is `Runtime.InvalidEntrypoint`, and the
+        # environment failures AWS names Runtime.* carry their own type.
+        error_type = getattr(e, "error_type", "") or "Runtime.Unknown"
+        # Do not transparently invoke again: the handler may already have
+        # performed side effects before its environment failed.
+        return {
+            "body": {"errorMessage": str(e), "errorType": error_type},
+            "error": True,
+            "log": "",
+        }
+    finally:
+        release_worker(worker)
+
+
 def _execute_function_provided(func: dict, event: dict) -> dict:
     """Execute a provided-runtime Lambda (Go/Rust binary) via a minimal Lambda Runtime API."""
     config = func.get("config") or func
@@ -5060,7 +5231,6 @@ def _execute_function_provided(func: dict, event: dict) -> dict:
         return {"body": {"statusCode": 200, "body": "Mock response - no code deployed"}}
 
     timeout = config.get("Timeout", 30)
-    env_vars = _runtime_env_vars(config)
 
     try:
         import http.server
@@ -5165,23 +5335,7 @@ def _execute_function_provided(func: dict, event: dict) -> dict:
         server_ready.wait(timeout=5)
 
         try:
-            # Build environment for the Lambda binary
-            proc_env = dict(os.environ)
-            proc_env.update({
-                "AWS_LAMBDA_RUNTIME_API": f"127.0.0.1:{port}",
-                "AWS_DEFAULT_REGION": get_region(),
-                "AWS_REGION": get_region(),
-                "AWS_ACCESS_KEY_ID": _account_region_from_function_config(config)[0],
-                "AWS_SECRET_ACCESS_KEY": os.environ.get("AWS_SECRET_ACCESS_KEY", "test"),
-                "AWS_LAMBDA_FUNCTION_NAME": config.get("FunctionName", "unknown"),
-                "AWS_LAMBDA_FUNCTION_MEMORY_SIZE": str(config.get("MemorySize", 128)),
-                "AWS_LAMBDA_FUNCTION_VERSION": config.get("Version", "$LATEST"),
-                "AWS_LAMBDA_LOG_STREAM_NAME": new_uuid(),
-                "LAMBDA_TASK_ROOT": code_dir,
-                "_HANDLER": config.get("Handler", "bootstrap"),
-            })
-            proc_env.update(env_vars)
-            proc_env.update(_durable_env_overlay())
+            proc_env = _provided_worker_env(config, code_dir, port)
             # X-Ray active tracing. ``_execute_function_provided`` builds
             # ``proc_env`` per-invocation, so a per-call trace ID is safe
             # here (unlike the RIE pool). aws-xray-sdk reads this env var
@@ -5190,19 +5344,6 @@ def _execute_function_provided(func: dict, event: dict) -> dict:
             if _xray_trace_id:
                 proc_env["_X_AMZN_TRACE_ID"] = _xray_trace_id
             proc_env[INVOKE_DEPTH_ENV] = str(_invoke_depth.get())
-            # Override AWS_ENDPOINT_URL *after* function env vars so
-            # Lambda binaries always call back to this MiniStack
-            # instance.  Function-level env vars may carry the
-            # host-mapped URL which is unreachable from inside the
-            # container.
-            endpoint = os.environ.get("AWS_ENDPOINT_URL", "")
-            if not endpoint:
-                hostname = os.environ.get("LOCALSTACK_HOSTNAME", "")
-                if hostname:
-                    endpoint = _normalize_endpoint_url(hostname)
-            if endpoint:
-                proc_env["AWS_ENDPOINT_URL"] = endpoint
-
             # Spawn under the code lock: no fork may overlap an extraction
             # write elsewhere, or the child inherits the open write fd and
             # execve fails with ETXTBSY (#1051).
@@ -5325,9 +5466,6 @@ def _execute_function_local(func: dict, event: dict) -> dict:
                 {
                     "AWS_DEFAULT_REGION": get_region(),
                     "AWS_REGION": get_region(),
-                    "AWS_ACCESS_KEY_ID": _account_region_from_function_config(config)[0],
-                    "AWS_SECRET_ACCESS_KEY": os.environ.get("AWS_SECRET_ACCESS_KEY", "test"),
-                    "AWS_SESSION_TOKEN": os.environ.get("AWS_SESSION_TOKEN", ""),
                     "AWS_LAMBDA_FUNCTION_NAME": config["FunctionName"],
                     "AWS_LAMBDA_FUNCTION_MEMORY_SIZE": str(config["MemorySize"]),
                     "AWS_LAMBDA_FUNCTION_VERSION": config.get("Version", "$LATEST"),
@@ -5340,6 +5478,7 @@ def _execute_function_local(func: dict, event: dict) -> dict:
                     "_LAMBDA_LAYERS_DIRS": os.pathsep.join(layers_dirs),
                 }
             )
+            env.update(execution_credentials(config))
             endpoint = _normalize_endpoint_url(os.environ.get("AWS_ENDPOINT_URL", ""))
             if not endpoint:
                 endpoint = _normalize_endpoint_url(env_vars.get("AWS_ENDPOINT_URL", ""))

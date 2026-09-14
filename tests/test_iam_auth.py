@@ -10,6 +10,7 @@ Integration tests (SimulateCustomPolicy, policy validation) run against
 the MiniStack server and work with AUTH=false.
 """
 
+import asyncio
 import json
 import time
 
@@ -17,19 +18,23 @@ import pytest
 from botocore.exceptions import ClientError
 
 from ministack.core.iam_evaluator import (
+    AmbiguousAccessKeyError,
     AuthError,
+    CredentialResolutionError,
     EvalContext,
     EvalResult,
     PrincipalInfo,
+    ResolvedCredential,
+    enforce,
     evaluate,
     evaluate_trust_policy,
-    enforce,
+    find_iam_access_key_account,
     fnmatch_iam,
     parse_policy_document,
+    resolve_credential,
     resolve_principal,
     validate_policy_document,
 )
-
 
 # ---------------------------------------------------------------------------
 # Wildcard matching (IAM spec: case-insensitive, * = any, ? = single char)
@@ -908,6 +913,86 @@ class TestResourceArn:
         from ministack.core.iam_actions import extract_resource_arn
         assert extract_resource_arn("dynamodb", "POST", "/", {}, b"{}", {}, "us-east-1", "123") == "*"
 
+    def test_dynamodb_index(self):
+        from ministack.core.iam_actions import extract_resource_arn
+        body = json.dumps(
+            {"TableName": "users", "IndexName": "email-index"}
+        ).encode()
+        assert extract_resource_arn(
+            "dynamodb", "POST", "/", {}, body, {}, "us-east-1", "123"
+        ) == "arn:aws:dynamodb:us-east-1:123:table/users/index/email-index"
+
+    def test_dynamodb_batch_request_uses_first_table(self):
+        from ministack.core.iam_actions import extract_resource_arn
+        body = json.dumps({"RequestItems": {"events": [], "snapshots": []}}).encode()
+        assert extract_resource_arn(
+            "dynamodb", "POST", "/", {}, body, {}, "us-east-1", "123"
+        ) == "arn:aws:dynamodb:us-east-1:123:table/events"
+
+    def test_dynamodb_batch_request_returns_every_table(self):
+        from ministack.core.iam_actions import dynamodb_resource_arns
+        body = json.dumps({"RequestItems": {"events": [], "snapshots": []}}).encode()
+        assert dynamodb_resource_arns(body, "us-east-1", "123") == [
+            "arn:aws:dynamodb:us-east-1:123:table/events",
+            "arn:aws:dynamodb:us-east-1:123:table/snapshots",
+        ]
+
+    def test_eventbridge_put_events_returns_every_bus(self):
+        from ministack.core.iam_actions import eventbridge_resource_arns
+        body = json.dumps({"Entries": [
+            {"EventBusName": "orders"},
+            {"Source": "example"},
+            {"EventBusName": "orders"},
+            {"EventBusName": "arn:aws:events:us-east-1:123:event-bus/audit"},
+        ]}).encode()
+        assert eventbridge_resource_arns(body, "us-east-1", "123") == [
+            "arn:aws:events:us-east-1:123:event-bus/orders",
+            "arn:aws:events:us-east-1:123:event-bus/default",
+            "arn:aws:events:us-east-1:123:event-bus/audit",
+        ]
+
+    def test_eventbridge_put_events_survives_a_malformed_entry(self):
+        from ministack.core.iam_actions import eventbridge_resource_arns
+        body = json.dumps({"Entries": ["junk", {"EventBusName": 7}]}).encode()
+        assert eventbridge_resource_arns(body, "us-east-1", "123") == [
+            "arn:aws:events:us-east-1:123:event-bus/default",
+        ]
+
+    def test_dynamodb_attributes_are_top_level_only(self):
+        """AWS resolves a ProjectionExpression of "Name, Address.City" to
+        ["Name", "Address"], substituting a placeholder per path segment."""
+        from ministack.core.iam_actions import dynamodb_service_context
+        body = json.dumps({
+            "TableName": "users",
+            "ProjectionExpression": "Name, Address.City, #a.#c, Items[0]",
+            "ExpressionAttributeNames": {"#a": "Addr", "#c": "City"},
+        }).encode()
+        context = dynamodb_service_context(body)
+        assert context["dynamodb:Attributes"] == ["Name", "Address", "Addr", "Items"]
+        assert context["dynamodb:Select"] == "SPECIFIC_ATTRIBUTES"
+
+    def test_dynamodb_select_is_always_resolved(self):
+        """Select always has a value on AWS, so a policy conditioning on it
+        with StringEqualsIfExists must not pass a projection-less request."""
+        from ministack.core.iam_actions import dynamodb_service_context
+        assert dynamodb_service_context(
+            json.dumps({"TableName": "users"}).encode()
+        ) == {"dynamodb:Select": "ALL_ATTRIBUTES"}
+        assert dynamodb_service_context(
+            json.dumps({"TableName": "users", "Select": "COUNT"}).encode()
+        )["dynamodb:Select"] == "COUNT"
+        assert dynamodb_service_context(
+            json.dumps({"TableName": "users", "AttributesToGet": ["a", "b"]}).encode()
+        ) == {"dynamodb:Attributes": ["a", "b"], "dynamodb:Select": "SPECIFIC_ATTRIBUTES"}
+        assert dynamodb_service_context(b"not json") == {}
+
+    def test_eventbridge_put_events_defaults_to_default_bus(self):
+        from ministack.core.iam_actions import extract_resource_arn
+        body = json.dumps({"Entries": [{"Source": "example"}]}).encode()
+        assert extract_resource_arn(
+            "events", "POST", "/", {}, body, {}, "us-east-1", "123"
+        ) == "arn:aws:events:us-east-1:123:event-bus/default"
+
     def test_lambda_function(self):
         from ministack.core.iam_actions import extract_resource_arn
         assert extract_resource_arn("lambda", "GET", "/2015-03-31/functions/my-func", {}, b"", {}, "us-east-1", "123") == "arn:aws:lambda:us-east-1:123:function:my-func"
@@ -1444,7 +1529,8 @@ class TestS3EnforcementSites:
         stmts = parse_policy_document(policy)
         seen = []
 
-        def enforce_stub(access_key_id, iam_action, service, region, resource_arn="*"):
+        def enforce_stub(access_key_id, iam_action, service, region, resource_arn="*",
+                         service_context=None):
             seen.append((iam_action, resource_arn))
             result = evaluate(_ctx(action=iam_action, resource=resource_arn), [stmts])
             if result.decision == "Allow":
@@ -1788,3 +1874,424 @@ def test_lambda_build_config_returns_a_config_not_an_error(monkeypatch):
     })
     assert isinstance(config, dict)
     assert config["FunctionName"] == "f"
+
+
+def test_lambda_execution_credentials_resolve_to_configured_role(monkeypatch):
+    """SDK calls from Lambda are evaluated against its execution role."""
+    import ministack.app as app_mod
+    from ministack.core.responses import _request_account_id
+    from ministack.services import iam as iam_svc
+    from ministack.services import lambda_svc
+    from ministack.services import sts as sts_svc
+
+    monkeypatch.setattr(app_mod, "AUTH", True, raising=False)
+    token = _request_account_id.set("000000000000")
+    role_name = "appointment-mark-canceled"
+    events_arn = "arn:aws:dynamodb:us-east-1:000000000000:table/events"
+    snapshots_arn = "arn:aws:dynamodb:us-east-1:000000000000:table/snapshots"
+    iam_svc._roles[role_name] = {
+        "AttachedPolicies": [],
+        "InlinePolicies": {
+            "events": json.dumps({
+                "Statement": [{
+                    "Effect": "Allow",
+                    "Action": ["dynamodb:PutItem", "dynamodb:BatchWriteItem"],
+                    "Resource": events_arn,
+                }]
+            })
+        },
+    }
+    try:
+        credentials = lambda_svc.execution_credentials({
+            "FunctionName": "appointment-mark-canceled",
+            "FunctionArn": (
+                "arn:aws:lambda:us-east-1:000000000000:function:"
+                "appointment-mark-canceled"
+            ),
+            "Role": f"arn:aws:iam::000000000000:role/{role_name}",
+        })
+        access_key = credentials["AWS_ACCESS_KEY_ID"]
+        assert access_key.startswith("ASIA")
+        assert credentials["AWS_SESSION_TOKEN"]
+        assert sts_svc._sessions[access_key]["Arn"].startswith(
+            f"arn:aws:sts::000000000000:assumed-role/{role_name}/"
+        )
+        assert enforce(
+            access_key,
+            "dynamodb:BatchWriteItem",
+            "dynamodb",
+            "us-east-1",
+            resource_arn=events_arn,
+        ) is None
+        denied = enforce(
+            access_key,
+            "dynamodb:BatchWriteItem",
+            "dynamodb",
+            "us-east-1",
+            resource_arn=snapshots_arn,
+        )
+        assert isinstance(denied, EvalResult)
+        assert denied.decision == "ImplicitDeny"
+    finally:
+        iam_svc._roles.pop(role_name, None)
+        sts_svc._sessions.clear()
+        _request_account_id.reset(token)
+
+
+def test_role_session_uses_account_from_session_arn():
+    from ministack.core.iam_evaluator import resolve_principal
+    from ministack.core.responses import _request_account_id
+    from ministack.services import iam as iam_svc
+    from ministack.services import sts as sts_svc
+
+    role_name = "cross-account-request-context"
+    account_id = "957398953894"
+    token = _request_account_id.set(account_id)
+    iam_svc._roles[role_name] = {
+        "AttachedPolicies": [],
+        "InlinePolicies": {"allow": json.dumps({"Statement": [{
+            "Effect": "Allow", "Action": "states:StartExecution", "Resource": "*",
+        }]})},
+    }
+    _request_account_id.reset(token)
+    sts_svc._sessions["ASIASESSIONACCOUNT"] = {
+        "Arn": f"arn:aws:sts::{account_id}:assumed-role/{role_name}/lambda",
+        "SecretAccessKey": "test-session-secret",
+    }
+    try:
+        principal = resolve_principal("ASIASESSIONACCOUNT", "000000000000")
+        assert principal.account == account_id
+        assert principal.policies
+    finally:
+        token = _request_account_id.set(account_id)
+        iam_svc._roles.pop(role_name, None)
+        _request_account_id.reset(token)
+        sts_svc._sessions.clear()
+
+
+def test_lambda_execution_role_explicit_deny_overrides_allow(monkeypatch):
+    import ministack.app as app_mod
+    from ministack.core.responses import _request_account_id
+    from ministack.services import iam as iam_svc
+    from ministack.services import lambda_svc
+    from ministack.services import sts as sts_svc
+
+    monkeypatch.setattr(app_mod, "AUTH", True, raising=False)
+    token = _request_account_id.set("000000000000")
+    role_name = "denied-writer"
+    table_arn = "arn:aws:dynamodb:us-east-1:000000000000:table/events"
+    iam_svc._roles[role_name] = {
+        "AttachedPolicies": [],
+        "InlinePolicies": {
+            "allow-and-deny": json.dumps({
+                "Statement": [
+                    {"Effect": "Allow", "Action": "dynamodb:*", "Resource": "*"},
+                    {
+                        "Effect": "Deny",
+                        "Action": "dynamodb:BatchWriteItem",
+                        "Resource": table_arn,
+                    },
+                ]
+            })
+        },
+    }
+    try:
+        access_key = lambda_svc.execution_credentials({
+            "FunctionName": "denied-writer",
+            "FunctionArn": "arn:aws:lambda:us-east-1:000000000000:function:denied-writer",
+            "Role": f"arn:aws:iam::000000000000:role/{role_name}",
+        })["AWS_ACCESS_KEY_ID"]
+        denied = enforce(
+            access_key,
+            "dynamodb:BatchWriteItem",
+            "dynamodb",
+            "us-east-1",
+            resource_arn=table_arn,
+        )
+        assert isinstance(denied, EvalResult)
+        assert denied.decision == "Deny"
+    finally:
+        iam_svc._roles.pop(role_name, None)
+        sts_svc._sessions.clear()
+        _request_account_id.reset(token)
+
+
+# ---------------------------------------------------------------------------
+# Access-key resolution (root / IAM user / STS session)
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_root_credential_from_environment(monkeypatch):
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "configured-root")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "configured-secret")
+    monkeypatch.setenv("AWS_SESSION_TOKEN", "configured-token")
+
+    credential = resolve_credential(
+        "configured-root", "123456789012", "configured-token"
+    )
+
+    assert isinstance(credential, ResolvedCredential)
+    assert credential.secret_access_key == "configured-secret"
+    assert credential.session_token == "configured-token"
+    assert credential.principal_arn == "arn:aws:iam::123456789012:root"
+
+
+def test_resolve_root_credential_treats_empty_environment_token_as_absent(monkeypatch):
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "configured-root")
+    monkeypatch.setenv("AWS_SESSION_TOKEN", "")
+
+    credential = resolve_credential("configured-root", "123456789012", "")
+
+    assert isinstance(credential, ResolvedCredential)
+    assert credential.session_token is None
+
+
+def test_resolve_numeric_root_accepts_optional_ambient_session_token(monkeypatch):
+    account_id = "123456789012"
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "configured-root")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "configured-secret")
+    monkeypatch.setenv("AWS_SESSION_TOKEN", "ambient-token")
+
+    with_token = resolve_credential(account_id, account_id, "ambient-token")
+    without_token = resolve_credential(account_id, account_id, "")
+    wrong_token = resolve_credential(account_id, account_id, "wrong-token")
+
+    assert isinstance(with_token, ResolvedCredential)
+    assert with_token.session_token == "ambient-token"
+    assert isinstance(without_token, ResolvedCredential)
+    assert without_token.session_token is None
+    assert isinstance(wrong_token, CredentialResolutionError)
+    assert wrong_token.code == "InvalidToken"
+
+
+def test_resolve_iam_credential_is_account_scoped_and_requires_active_status():
+    from ministack.services import iam as iam_svc
+
+    access_key = "AKIATESTSCOPED00001"
+    first_account = "111111111111"
+    second_account = "222222222222"
+    iam_svc._access_keys.set_scoped(first_account, None, access_key, {
+        "AccessKeyId": access_key,
+        "SecretAccessKey": "first-secret",
+        "Status": "Active",
+        "UserName": "first-user",
+    })
+    iam_svc._access_keys.set_scoped(second_account, None, access_key, {
+        "AccessKeyId": access_key,
+        "SecretAccessKey": "second-secret",
+        "Status": "Inactive",
+        "UserName": "second-user",
+    })
+    try:
+        first = resolve_credential(access_key, first_account, "")
+        second = resolve_credential(access_key, second_account, "")
+
+        assert isinstance(first, ResolvedCredential)
+        assert first.secret_access_key == "first-secret"
+        assert first.principal_arn == (
+            "arn:aws:iam::111111111111:user/first-user"
+        )
+        assert isinstance(second, CredentialResolutionError)
+        assert second.code == "InvalidClientTokenId"
+        with pytest.raises(AmbiguousAccessKeyError):
+            find_iam_access_key_account(access_key)
+    finally:
+        iam_svc._access_keys.pop_scoped(first_account, None, access_key, None)
+        iam_svc._access_keys.pop_scoped(second_account, None, access_key, None)
+
+
+def test_resolve_sts_credential_checks_token_expiry_and_origin():
+    from ministack.services import sts as sts_svc
+
+    access_key = "ASIATESTSESSION0001"
+    account_id = "123456789012"
+    sts_svc._sessions[access_key] = {
+        "Arn": f"arn:aws:iam::{account_id}:user/alice",
+        "UserId": "AIDAALICE",
+        "SecretAccessKey": "session-secret",
+        "SessionToken": "session-token",
+        "Expiration": time.time() + 60,
+        "AccountId": account_id,
+        "PrincipalType": "User",
+        "SourceAccessKeyId": "AKIAALICE",
+    }
+    try:
+        credential = resolve_credential(access_key, account_id, "session-token")
+        wrong = resolve_credential(access_key, account_id, "wrong-token")
+        missing = resolve_credential(access_key, account_id, "")
+        non_ascii = resolve_credential(access_key, account_id, "not-valid-☃")
+
+        assert isinstance(credential, ResolvedCredential)
+        assert credential.principal_type == "User"
+        assert credential.principal_name == "alice"
+        assert credential.source_access_key_id == "AKIAALICE"
+        assert isinstance(wrong, CredentialResolutionError)
+        assert wrong.code == "InvalidToken"
+        assert isinstance(missing, CredentialResolutionError)
+        assert missing.code == "InvalidToken"
+        assert isinstance(non_ascii, CredentialResolutionError)
+        assert non_ascii.code == "InvalidToken"
+
+        sts_svc._sessions[access_key]["Expiration"] = time.time() - 1
+        expired = resolve_credential(access_key, account_id, "session-token")
+        assert isinstance(expired, CredentialResolutionError)
+        assert expired.code == "ExpiredTokenException"
+    finally:
+        sts_svc._sessions.pop(access_key, None)
+
+
+def test_find_iam_access_key_account_returns_unique_owner():
+    from ministack.services import iam as iam_svc
+
+    access_key = "test-account-lookup-key"
+    account_id = "123456789012"
+    iam_svc._access_keys.set_scoped(account_id, None, access_key, {
+        "AccessKeyId": access_key,
+        "SecretAccessKey": "secret",
+        "Status": "Active",
+        "UserName": "alice",
+    })
+    try:
+        assert find_iam_access_key_account(access_key) == account_id
+    finally:
+        iam_svc._access_keys.pop_scoped(account_id, None, access_key, None)
+
+
+def test_resolve_get_session_token_principal_retains_user_policies():
+    from ministack.services import iam as iam_svc
+    from ministack.services import sts as sts_svc
+
+    access_key = "test-session-access-key"
+    account_id = "123456789012"
+    user_name = "alice"
+    iam_svc._users.set_scoped(account_id, None, user_name, {
+        "UserName": user_name,
+        "UserId": "AIDAALICE",
+        "AttachedPolicies": [],
+    })
+    iam_svc._user_inline_policies[user_name] = {
+        "allow-s3": {
+            "Statement": [{
+                "Effect": "Allow",
+                "Action": "s3:GetObject",
+                "Resource": "*",
+            }],
+        },
+    }
+    sts_svc._sessions[access_key] = {
+        "Arn": f"arn:aws:iam::{account_id}:user/team/{user_name}",
+        "UserId": "AIDAALICE",
+        "SecretAccessKey": "session-secret",
+        "SessionToken": "session-token",
+        "Expiration": time.time() + 60,
+        "AccountId": account_id,
+        "PrincipalType": "User",
+        "PrincipalName": user_name,
+        "SourceAccessKeyId": "AKIAALICE",
+    }
+    try:
+        principal = resolve_principal(access_key, account_id)
+
+        assert isinstance(principal, PrincipalInfo)
+        assert principal.type == "User"
+        assert principal.arn == (
+            f"arn:aws:iam::{account_id}:user/team/{user_name}"
+        )
+        assert principal.policies
+        assert principal.policies[0][0].actions == ["s3:GetObject"]
+    finally:
+        sts_svc._sessions.pop(access_key, None)
+        iam_svc._user_inline_policies.pop(user_name, None)
+        iam_svc._users.pop_scoped(account_id, None, user_name, None)
+
+
+def test_ambiguous_iam_access_key_is_rejected_before_http_routing(monkeypatch):
+    from ministack import app as app_mod
+    from ministack.core.responses import get_account_id, set_request_account_id
+    from ministack.services import iam as iam_svc
+
+    monkeypatch.setattr(app_mod, "AUTH", True)
+    access_key = "test-ambiguous-http-key"
+    accounts = ("000000000000", "123456789012")
+    original_account = get_account_id()
+    sent = []
+    for account_id in accounts:
+        iam_svc._access_keys.set_scoped(account_id, None, access_key, {
+            "AccessKeyId": access_key,
+            "SecretAccessKey": f"secret-{account_id}",
+            "Status": "Active",
+            "UserName": f"user-{account_id}",
+        })
+    scope = {
+        "type": "http",
+        "method": "GET",
+        "path": "/",
+        "headers": [(b"host", b"s3.localhost")],
+        "query_string": (
+            f"X-Amz-Credential={access_key}/20260908/us-east-1/s3/aws4_request"
+        ).encode(),
+    }
+
+    async def receive():
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def send(message):
+        sent.append(message)
+
+    try:
+        asyncio.run(app_mod.app(scope, receive, send))
+
+        assert sent[0]["type"] == "http.response.start"
+        assert sent[0]["status"] == 403
+        assert b"InvalidClientTokenId" in sent[1]["body"]
+    finally:
+        for account_id in accounts:
+            iam_svc._access_keys.pop_scoped(account_id, None, access_key, None)
+        set_request_account_id(original_account)
+
+
+@pytest.mark.parametrize("auth_enabled", [False, True])
+@pytest.mark.parametrize("ambiguous", [False, True])
+def test_http_iam_routing_respects_auth_mode(monkeypatch, auth_enabled, ambiguous):
+    from ministack import app as app_mod
+    from ministack.core.responses import get_account_id, request_scope
+    from ministack.services import iam as iam_svc
+
+    key = "test-routing-mode-key"
+    owner = "123456789012"
+    accounts = [owner, "234567890123"] if ambiguous else [owner]
+    monkeypatch.setattr(app_mod, "AUTH", auth_enabled)
+    monkeypatch.setenv("MINISTACK_ACCOUNT_ID", "000000000000")
+    routed = []
+    sent = []
+
+    async def capture(*args):
+        routed.append(get_account_id())
+        return 200, {}, b"ok"
+
+    async def receive():
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def send(message):
+        sent.append(message)
+
+    monkeypatch.setattr(app_mod, "_handle_pre_body_request", capture)
+    for account in accounts:
+        iam_svc._access_keys.set_scoped(account, None, key, {"UserName": "alice"})
+    try:
+        with request_scope("000000000000", "us-east-1"):
+            asyncio.run(app_mod.app({
+                "type": "http", "method": "GET", "path": "/",
+                "headers": [(b"host", b"sts.localhost"), (
+                    b"authorization",
+                    f"AWS4-HMAC-SHA256 Credential={key}/20260911/us-east-1/sts/aws4_request".encode(),
+                )],
+                "query_string": b"",
+            }, receive, send))
+        assert sent[0]["status"] == (403 if auth_enabled and ambiguous else 200)
+        assert routed == ([] if auth_enabled and ambiguous else [
+            owner if auth_enabled else "000000000000"
+        ])
+    finally:
+        for account in accounts:
+            iam_svc._access_keys.pop_scoped(account, None, key, None)
