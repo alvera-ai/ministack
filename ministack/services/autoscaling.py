@@ -22,7 +22,6 @@ import copy
 import logging
 import os
 
-from ministack.core.persistence import load_state
 from ministack.core.responses import (
     AccountRegionScopedDict,
     AccountScopedDict,
@@ -63,7 +62,11 @@ def get_state():
     }
 
 
-def restore_state(data):
+def load_persisted_state(data):
+    return _restore_state(data)
+
+
+def _restore_state(data):
     if not data:
         return
 
@@ -105,12 +108,6 @@ def _restore_asg_child_store(store, restored, asg_regions):
         store.set_scoped(account_id, region, key, value)
 
 
-try:
-    _restored = load_state("autoscaling")
-    if _restored:
-        restore_state(_restored)
-except Exception:
-    logger.exception("Failed to restore persisted autoscaling state; continuing fresh")
 
 
 def reset():
@@ -228,7 +225,7 @@ def _create_asg(p):
     if not name:
         return _error("ValidationError", "AutoScalingGroupName is required")
     if name in _asgs:
-        return _error("AlreadyExistsFault", f"AutoScalingGroup {name} already exists")
+        return _error("AlreadyExists", f"AutoScalingGroup {name} already exists")
 
     arn = _asg_arn(name)
     _asgs[name] = {
@@ -474,7 +471,7 @@ def _create_lc(p):
     if not name:
         return _error("ValidationError", "LaunchConfigurationName is required")
     if name in _launch_configs:
-        return _error("AlreadyExistsFault", f"LaunchConfiguration {name} already exists")
+        return _error("AlreadyExists", f"LaunchConfiguration {name} already exists")
     arn = f"arn:aws:autoscaling:{get_region()}:{get_account_id()}:launchConfiguration:{new_uuid()}:launchConfigurationName/{name}"
     _launch_configs[name] = {
         "LaunchConfigurationName": name,

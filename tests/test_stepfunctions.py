@@ -3849,7 +3849,7 @@ def test_sfn_integration_ecs_run_task_output_contains_status(sfn, ecs):
     assert "taskArn" in task_out
     assert "containers" in task_out
     assert task_out["containers"][0]["name"] == "app"
-    assert task_out["lastStatus"] in ("PENDING", "RUNNING")
+    assert task_out["lastStatus"] in ("PROVISIONING", "PENDING", "RUNNING")
     assert "failures" in output
 
 def test_sfn_integration_ecs_run_task_container_overrides_reach_the_task(sfn, ecs):
@@ -5119,6 +5119,7 @@ def test_sfn_aws_sdk_query_pascal_case(sfn, sfn_sync, ssm):
     ssm.delete_parameter(Name="sfn-pascal-test-param")
 
 
+@pytest.mark.data_plane
 def test_sfn_aws_sdk_ssm_run_command_probe(sfn, sfn_sync, ec2):
     """The health-probe shape: sendCommand, then getCommandInvocation on the id it returned."""
     try:

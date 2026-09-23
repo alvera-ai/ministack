@@ -56,7 +56,6 @@ from ministack.core.iam_evaluator import (
     find_iam_access_key_account,
     resolve_credential,
 )
-from ministack.core.persistence import load_state
 from ministack.core.responses import (
     AccountScopedDict,
     get_account_id,
@@ -68,6 +67,7 @@ from ministack.core.responses import (
     set_request_account_id,
     set_request_region,
 )
+from ministack.core.router import extract_access_key_id
 from ministack.core.sigv4 import (
     build_canonical_request,
     build_string_to_sign,
@@ -158,7 +158,7 @@ _completed_multipart_uploads = AccountScopedDict()
 
 # Module-level registry of per-bucket dicts that round-trip through s3.json.
 # One entry per module global: adding a new _bucket_* dict means one line here,
-# not two separate edits in get_state/restore_state. Must sit below every
+# not two separate edits in get_state/_restore_state. Must sit below every
 # _bucket_* declaration above — the dict literal holds live references.
 # Excludes _buckets (has bespoke objects-stripping + legacy fallback) and
 # per-bucket keys like _ownership_controls / _public_access_block that live
@@ -198,32 +198,28 @@ def get_state():
     return state
 
 
-def restore_state(data):
+def load_persisted_state(data):
+    return _restore_state(data)
+
+
+def _restore_state(data):
     if not data:
         return
     bm = data.get("buckets_meta", {})
+    # Object persistence may already have created placeholder buckets during
+    # import. Restore metadata onto those records without replacing objects.
     if isinstance(bm, AccountScopedDict):
         # Restore all accounts' buckets directly via _data
         for scoped_key, meta in bm._data.items():
-            if scoped_key not in _buckets._data:
-                _buckets._data[scoped_key] = {**meta, "objects": {}}
+            _buckets._data.setdefault(scoped_key, {"objects": {}}).update(meta)
     else:
         # Legacy plain-dict format (pre-multi-tenancy)
         for name, meta in bm.items():
-            if name not in _buckets:
-                _buckets[name] = {**meta, "objects": {}}
+            _buckets.setdefault(name, {"objects": {}}).update(meta)
     for key, d in _PERSISTED_BUCKET_DICTS.items():
         d.update(data.get(key, {}))
 
 
-try:
-    _restored = load_state("s3")
-    if _restored:
-        restore_state(_restored)
-except Exception:
-    import logging
-
-    logging.getLogger(__name__).exception("Failed to restore persisted state; continuing with fresh store")
 
 
 DATA_DIR = os.environ.get("S3_DATA_DIR", "/tmp/ministack-data/s3")
@@ -764,6 +760,156 @@ def _get_object_data(bucket_name: str, key: str, version_id: str | None = None) 
     if obj is None:
         return None
     return _read_body(bucket_name, key, obj)
+
+
+_ACL_GROUP_AUTHENTICATED = "http://acs.amazonaws.com/groups/global/AuthenticatedUsers"
+# The permissions that answer a read and a write, FULL_CONTROL covering both.
+_ACL_READ_PERMS = ("READ", "FULL_CONTROL")
+_ACL_WRITE_PERMS = ("WRITE", "FULL_CONTROL")
+
+
+def _acl_group_grants(stored_xml: str | None) -> list[tuple[str, str]]:
+    """``(group URI, permission)`` for every Group grant in a stored ACL."""
+    if not stored_xml:
+        return []
+    try:
+        root = fromstring(stored_xml.encode() if isinstance(stored_xml, str) else stored_xml)
+    except Exception:
+        return []
+    grants = []
+    for grant in root.iter():
+        if not grant.tag.endswith("Grant"):
+            continue
+        uri = permission = ""
+        for child in grant.iter():
+            if child.tag.endswith("URI") and child.text:
+                uri = child.text.strip()
+            elif child.tag.endswith("Permission") and child.text:
+                permission = child.text.strip()
+        if uri and permission:
+            grants.append((uri, permission))
+    return grants
+
+
+def _public_access_blocked(owner_account: str, bucket_name: str) -> bool:
+    """Whether the bucket's Public Access Block shuts public grants off."""
+    record = _buckets.get_scoped(owner_account, None, bucket_name) or {}
+    stored = record.get("_public_access_block")
+    if not stored:
+        return False
+    try:
+        root = fromstring(stored.encode() if isinstance(stored, str) else stored)
+    except Exception:
+        return False
+    for child in root.iter():
+        if child.tag.endswith(("BlockPublicAcls", "RestrictPublicBuckets",
+                               "BlockPublicPolicy", "IgnorePublicAcls")):
+            if (child.text or "").strip().lower() == "true":
+                return True
+    return False
+
+
+def _account_from_access_key(access_key: str) -> str:
+    """The tenant an access key selects, the way the router scopes a request."""
+    try:
+        return find_iam_access_key_account(access_key) or access_key
+    except AmbiguousAccessKeyError:
+        return ""
+
+
+def _bucket_owner_account(name: str) -> str | None:
+    """The account that owns *name*, or None.
+
+    "General purpose buckets exist in a global namespace, which means that each
+    bucket name must be unique across all AWS accounts in all the AWS Regions
+    within a partition" — so a name identifies one bucket, whoever asks. The
+    store stays account-scoped; this is the index over it.
+    """
+    for account_id, bucket_name in _buckets._data:
+        if bucket_name == name:
+            return account_id
+    return None
+
+
+def _foreign_bucket_allows(owner_account: str, bucket_name: str, key: str,
+                           method: str, query_params: dict, caller: str) -> bool:
+    """Whether a caller who does not own the bucket may have this request.
+
+    The owner's grants decide it: a Group grant on the bucket or the object
+    ACL, or an allow in the bucket policy. Nothing granted means the request
+    is denied, which is S3's default for a bucket nobody has opened up.
+    """
+    if _public_access_blocked(owner_account, bucket_name):
+        return False
+    wants = _ACL_READ_PERMS if method in ("GET", "HEAD") else _ACL_WRITE_PERMS
+    groups = [_ACL_GROUP_ALL_USERS] if not caller else [
+        _ACL_GROUP_ALL_USERS, _ACL_GROUP_AUTHENTICATED]
+
+    acls = [_bucket_acl.get_scoped(owner_account, None, bucket_name)]
+    if key:
+        acls.append(_object_acl.get_scoped(owner_account, None, (bucket_name, key, "")))
+    for stored in acls:
+        for uri, permission in _acl_group_grants(stored):
+            if uri in groups and permission in wants:
+                return True
+
+    policy = _bucket_policies.get_scoped(owner_account, None, bucket_name)
+    if policy:
+        from ministack.core.iam_evaluator import EvalContext, evaluate_resource_policy
+
+        action = "s3:GetObject" if method in ("GET", "HEAD") else "s3:PutObject"
+        resource = f"arn:aws:s3:::{bucket_name}"
+        ctx = EvalContext(
+            principal_arn=f"arn:aws:iam::{caller}:root" if caller else "*",
+            principal_type="Root" if caller else "Anonymous",
+            principal_account=caller or "",
+            action=action,
+            resource_arn=f"{resource}/{key}" if key else resource,
+            region=get_region(),
+        )
+        if evaluate_resource_policy(policy, ctx).decision == "Allow":
+            return True
+    return False
+
+
+def _request_access_key(method: str, key: str, headers: dict, query_params: dict,
+                        body: bytes) -> str:
+    """The caller's access key, including the one a browser POST signs into its
+    form rather than a header or the query string."""
+    access_key = extract_access_key_id(headers, query_params)
+    if not access_key and method == "POST" and not key:
+        access_key = _post_form_access_key_id(
+            _parse_multipart_form(headers.get("content-type", ""), body))
+    return access_key
+
+
+def _apply_bucket_scope(method: str, bucket: str, key: str, headers: dict,
+                        query_params: dict, body: bytes = b""):
+    """Resolve the request's bucket in the global namespace and gate it.
+
+    A bucket name identifies one bucket whoever asks, so a request for a name
+    another account owns is answered by that bucket — if its owner granted the
+    access. The scope is pinned to the owner for the rest of the request, so
+    every account-scoped lookup behind this reads the right tenant's state.
+    """
+    if not bucket:
+        return None
+    owner = _bucket_owner_account(bucket)
+    caller = get_account_id()
+    if owner is None or owner == caller:
+        return None
+    if method == "PUT" and not key and not query_params:
+        # CreateBucket answers BucketAlreadyExists for a taken name.
+        return None
+    access_key = _request_access_key(method, key, headers, query_params, body)
+    if access_key and _account_from_access_key(access_key) == owner:
+        # The caller is the owner; the credential just was not in a header.
+        set_request_account_id(owner)
+        return None
+    if not _foreign_bucket_allows(owner, bucket, key, method, query_params, access_key and caller):
+        return _error("AccessDenied", "Access Denied", 403, f"/{bucket}/{key}" if key else f"/{bucket}")
+    set_request_account_id(owner)
+    return None
 
 
 def _ensure_bucket(name: str):
@@ -1710,6 +1856,13 @@ async def handle_request(
     # reach the handlers exactly as a header-signed request delivers them.
     headers = _merge_hoisted_amz_headers(headers, query_params)
 
+    denied = _apply_bucket_scope(method, bucket, key, headers, query_params, body)
+    if denied is not None:
+        status, resp_headers, resp_body = denied
+        resp_headers.setdefault("x-amz-request-id", new_uuid())
+        resp_headers.setdefault("x-amz-id-2", base64.b64encode(os.urandom(48)).decode())
+        return status, resp_headers, resp_body
+
     result = _dispatch(method, bucket, key, headers, body, query_params)
 
     status, resp_headers, resp_body = result
@@ -1984,6 +2137,18 @@ def _create_bucket(name: str, body: bytes, headers: dict = None):
     if name in _buckets:
         # Idempotent: same account already owns it — return 200 like real AWS
         return 200, {"Location": f"/{name}"}, b""
+    if _bucket_owner_account(name) is not None:
+        # "After creating a general purpose bucket in the shared global
+        # namespace, that bucket name is unavailable for anyone else to create
+        # within a partition."
+        return _error(
+            "BucketAlreadyExists",
+            "The requested bucket name is not available. The bucket namespace "
+            "is shared by all users of the system. Please select a different "
+            "name and try again.",
+            409,
+            f"/{name}",
+        )
 
     region = None
     tags = {}
@@ -2647,6 +2812,51 @@ def _get_bucket_notification(name: str):
     return 200, {"Content-Type": "application/xml"}, _xml_body(root)
 
 
+def _generated_notification_id() -> str:
+    """An omitted Id is base64 of a UUID (captured us-east-1 2026-09-20)."""
+    return base64.b64encode(new_uuid().encode()).decode().rstrip("=")
+
+
+def _notification_configs_to_xml(configs, has_eventbridge: bool) -> str:
+    """The canonical wire form of a notification configuration.
+
+    Element names come from the S3 model's locationName, which is what every
+    AWS SDK reads: LambdaFunctionConfigurations -> CloudFunctionConfiguration
+    and LambdaFunctionArn -> CloudFunction. Storing whatever spelling the
+    caller happened to send means a GET only parses for that same client.
+    """
+    root = Element("NotificationConfiguration", xmlns=S3_NS)
+    wire = {
+        "sqs": ("QueueConfiguration", "Queue"),
+        "sns": ("TopicConfiguration", "Topic"),
+        "lambda": ("CloudFunctionConfiguration", "CloudFunction"),
+    }
+    for config in configs or []:
+        names = wire.get(config.get("type"))
+        if not names:
+            continue
+        cfg_tag, arn_tag = names
+        cfg_el = SubElement(root, cfg_tag)
+        if config.get("id"):
+            SubElement(cfg_el, "Id").text = str(config["id"])
+        SubElement(cfg_el, arn_tag).text = str(config.get("arn", ""))
+        for event in config.get("events") or []:
+            SubElement(cfg_el, "Event").text = str(event)
+        rules = [("prefix", config.get("filter_prefix")),
+                 ("suffix", config.get("filter_suffix"))]
+        if any(value is not None for _name, value in rules):
+            s3key_el = SubElement(SubElement(cfg_el, "Filter"), "S3Key")
+            for name, value in rules:
+                if value is None:
+                    continue
+                rule_el = SubElement(s3key_el, "FilterRule")
+                SubElement(rule_el, "Name").text = name
+                SubElement(rule_el, "Value").text = value
+    if has_eventbridge:
+        SubElement(root, "EventBridgeConfiguration")
+    return tostring(root, encoding="unicode")
+
+
 def _put_bucket_notification(name: str, body: bytes):
     if name not in _buckets:
         return _no_such_bucket(name)
@@ -2656,7 +2866,8 @@ def _put_bucket_notification(name: str, body: bytes):
     validation_error = _validate_notification_configs(configs, bucket_region)
     if validation_error:
         return validation_error
-    _bucket_notifications[name] = raw
+    _bucket_notifications[name] = _notification_configs_to_xml(
+        configs, "EventBridgeConfiguration" in raw)
     # Fire the s3:TestEvent synchronously so it's delivered before PutBucketNotification
     # returns — matches AWS's effective behaviour and avoids a race where the
     # client polls the destination queue/topic before the background thread has
@@ -2945,7 +3156,8 @@ def _parse_notification_config_raw(raw: str | None) -> list[dict]:
                 continue
 
             id_el = _find_xml_tag(cfg_el, "Id")
-            config_id = id_el.text if id_el is not None and id_el.text else new_uuid()
+            config_id = (id_el.text if id_el is not None and id_el.text
+                         else _generated_notification_id())
 
             events: list[str] = []
             for ev_el in list(cfg_el.findall(f"{{{S3_NS}}}Event")) + list(cfg_el.findall("Event")):
@@ -3056,11 +3268,44 @@ def _validate_notification_target_arn(target_type: str, arn: str, bucket_region:
     return None
 
 
+def _notification_destination_exists(target_type: str, arn: str, bucket_region: str) -> bool:
+    """Whether the queue or topic an SQS/SNS destination names is there.
+
+    S3 verifies an SNS or SQS destination by sending it a test notification,
+    and "if the message fails, the entire PUT action will fail, and Amazon S3
+    will not add the configuration to your bucket". A Lambda destination is
+    verified through its function permissions instead, which this emulator
+    does not model, so a Lambda target is not checked here.
+    """
+    spec = _parse_delivery_notification_target(target_type, arn, bucket_region)
+    if not spec:
+        return False
+    if target_type == "sqs":
+        from ministack.services import sqs as _sqs
+
+        return bool(_queue_name_from_sqs_arn_spec(spec)) and _sqs._queue_by_arn(str(spec)) is not None
+    from ministack.services import sns as _sns
+
+    return bool(_topic_name_from_sns_arn_spec(spec)) and _sns._topics.get(arn) is not None
+
+
 def _validate_notification_configs(configs: list[dict], bucket_region: str) -> tuple | None:
     for cfg in configs:
         error = _validate_notification_target_arn(cfg["type"], cfg["arn"], bucket_region)
         if error:
             return error
+    # The destination check is second: an ARN that does not parse is reported
+    # as malformed before anything tries to reach what it names.
+    unreachable = [
+        cfg["arn"] for cfg in configs
+        if cfg["type"] in ("sqs", "sns")
+        and not _notification_destination_exists(cfg["type"], cfg["arn"], bucket_region)
+    ]
+    if unreachable:
+        return _invalid_notification_config(
+            "Unable to validate the following destination configurations: "
+            + ", ".join(unreachable)
+        )
     return None
 
 
@@ -3565,6 +3810,16 @@ def _enforce_post_policy_size(policy_b64: str, size: int):
                 )
     return None
 
+def _post_form_access_key_id(parts) -> str:
+    for name, _filename, _part_headers, value in parts:
+        if name.lower() not in ("x-amz-credential", "awsaccesskeyid"):
+            continue
+        try:
+            credential = value.decode("utf-8")
+        except UnicodeDecodeError:
+            return ""
+        return credential.split("/", 1)[0]
+    return ""
 
 def _post_object(bucket_name: str, body: bytes, headers: dict):
     """Browser-based form upload (RFC 1867 / S3 PostObject).
@@ -3576,11 +3831,16 @@ def _post_object(bucket_name: str, body: bytes, headers: dict):
     `success_action_redirect`. Policy and signature fields are accepted and
     ignored — same lenient stance as ministack's presigned-URL handling.
     """
+    parts = _parse_multipart_form(headers.get("content-type", ""), body)
+
+    access_key_id = _post_form_access_key_id(parts)
+    if access_key_id:
+        set_request_account_id(access_key_id)
+
     bucket = _ensure_bucket(bucket_name)
     if bucket is None:
         return _no_such_bucket(bucket_name)
 
-    parts = _parse_multipart_form(headers.get("content-type", ""), body)
     if not parts:
         return _error(
             "MalformedPOSTRequest", "The body of your POST request is not well-formed multipart/form-data.", 400

@@ -82,28 +82,47 @@ class AuthError:
 # Wildcard matching (IAM-style)
 # ---------------------------------------------------------------------------
 
-_FNMATCH_CACHE: dict[str, re.Pattern] = {}
+_FNMATCH_CACHE: dict[tuple[str, bool], re.Pattern] = {}
 
 
-def fnmatch_iam(value: str, pattern: str) -> bool:
-    """Case-insensitive IAM wildcard match.  ``*`` = any chars, ``?`` = one char."""
-    if pattern == "*":
-        return True
-    key = pattern.lower()
+def _fnmatch_compile(pattern: str, ignore_case: bool) -> re.Pattern:
+    key = (pattern.lower() if ignore_case else pattern, ignore_case)
     compiled = _FNMATCH_CACHE.get(key)
     if compiled is None:
         regex = ""
-        for ch in key:
+        for ch in key[0]:
             if ch == "*":
                 regex += ".*"
             elif ch == "?":
                 regex += "."
             else:
                 regex += re.escape(ch)
-        compiled = re.compile(f"^{regex}$", re.IGNORECASE)
+        compiled = re.compile(f"^{regex}$", re.IGNORECASE if ignore_case else 0)
         if len(_FNMATCH_CACHE) < 4096:
             _FNMATCH_CACHE[key] = compiled
-    return compiled.match(value) is not None
+    return compiled
+
+
+def fnmatch_iam(value: str, pattern: str) -> bool:
+    """Case-insensitive IAM wildcard match, for Action/NotAction.
+
+    ``*`` = any chars, ``?`` = one char.
+    """
+    if pattern == "*":
+        return True
+    return _fnmatch_compile(pattern, True).match(value) is not None
+
+
+def fnmatch_iam_cs(value: str, pattern: str) -> bool:
+    """Case-sensitive IAM wildcard match, for Resource/NotResource, StringLike
+    and the Arn operators: "In the Resource element, the IAM user name is case
+    sensitive" (reference_policies_elements_resource), "Case-sensitive matching"
+    for StringLike and "Case-sensitive matching of the ARN" for ArnEquals/ArnLike
+    (reference_policies_elements_condition_operators).
+    """
+    if pattern == "*":
+        return True
+    return _fnmatch_compile(pattern, False).match(value) is not None
 
 
 # ---------------------------------------------------------------------------
@@ -122,9 +141,9 @@ def _action_matches(request_action: str, actions: list[str],
 def _resource_matches(resource_arn: str, resources: list[str],
                       not_resources: list[str]) -> bool:
     if resources:
-        return any(fnmatch_iam(resource_arn, p) for p in resources)
+        return any(fnmatch_iam_cs(resource_arn, p) for p in resources)
     if not_resources:
-        return not any(fnmatch_iam(resource_arn, p) for p in not_resources)
+        return not any(fnmatch_iam_cs(resource_arn, p) for p in not_resources)
     return True
 
 
@@ -150,6 +169,20 @@ def _account_from_arn(arn: str) -> str | None:
     if len(parts) < 6:
         return None
     return parts[4] if _ACCOUNT_ID_RE.fullmatch(parts[4]) else None
+
+
+def _principal_org_id(account_id: str) -> str | None:
+    """aws:PrincipalOrgID, the Organization the calling account belongs to.
+    In this emulator every account is the master of its own org the moment it
+    calls Organizations and member accounts are not modelled, so the id
+    resolves from that account's own scope, and an account that never called
+    Organizations has none."""
+    try:
+        from ministack.services import organizations as org_svc
+        org = org_svc._orgs.get_scoped(account_id, None, "self")
+    except Exception:
+        return None
+    return org.get("Id") if isinstance(org, dict) else None
 
 
 def _resolve_condition_key(key: str, ctx: EvalContext) -> Any:
@@ -186,6 +219,8 @@ def _resolve_condition_key(key: str, ctx: EvalContext) -> Any:
         return _account_from_arn(ctx.resource_arn) or ctx.principal_account
     if k in ctx.service_context:
         return ctx.service_context[k]
+    if k == "aws:principalorgid":
+        return _principal_org_id(ctx.principal_account)
     return None  # key not present
 
 
@@ -208,11 +243,11 @@ def _op_string_not_equals_ignore_case(actual: str, expected: str) -> bool:
 
 
 def _op_string_like(actual: str, expected: str) -> bool:
-    return fnmatch_iam(actual, expected)
+    return fnmatch_iam_cs(actual, expected)
 
 
 def _op_string_not_like(actual: str, expected: str) -> bool:
-    return not fnmatch_iam(actual, expected)
+    return not fnmatch_iam_cs(actual, expected)
 
 
 def _op_numeric(actual: str, expected: str, cmp: str) -> bool:
@@ -291,11 +326,11 @@ def _op_not_ip_address(actual: str, expected: str) -> bool:
 
 
 def _op_arn_like(actual: str, expected: str) -> bool:
-    return fnmatch_iam(actual, expected)
+    return fnmatch_iam_cs(actual, expected)
 
 
 def _op_arn_not_like(actual: str, expected: str) -> bool:
-    return not fnmatch_iam(actual, expected)
+    return not fnmatch_iam_cs(actual, expected)
 
 
 # Operator dispatch table
@@ -539,6 +574,35 @@ def evaluate(ctx: EvalContext,
     # Step 3: implicit deny
     return EvalResult("ImplicitDeny", ctx.principal_arn, "",
                       "No matching Allow statement")
+
+
+def evaluate_resource_policy(doc: str | dict | None, ctx: EvalContext) -> EvalResult:
+    """Evaluate a Lambda layer-version policy for the account principal in *ctx*.
+
+    Such a document names the principals it applies to, so a statement counts
+    only when its ``AWS`` principal (or ``*``) matches the caller; action,
+    resource, conditions and deny-before-allow are then the ordinary
+    evaluation. ``Service`` principals are ignored, since the trust-policy
+    matcher lets them match any account root. A statement carrying only
+    ``NotPrincipal`` never matches, leaving that unsupported form closed."""
+    if isinstance(doc, str):
+        try:
+            doc = json.loads(doc)
+        except (json.JSONDecodeError, TypeError):
+            doc = None
+    statements = doc.get("Statement", []) if isinstance(doc, dict) else []
+    if isinstance(statements, dict):
+        statements = [statements]
+    applicable = []
+    for stmt in statements if isinstance(statements, list) else []:
+        if not isinstance(stmt, dict):
+            continue
+        principal = stmt.get("Principal", {})
+        if isinstance(principal, dict):
+            principal = {"AWS": principal.get("AWS", [])}
+        if _principal_matches(principal, ctx.principal_arn):
+            applicable.append(stmt)
+    return evaluate(ctx, [parse_policy_document({"Statement": applicable})])
 
 
 # ---------------------------------------------------------------------------
@@ -937,25 +1001,13 @@ def resolve_caller_identity(access_key_id: str) -> dict | None:
         return None
     account_id = get_account_id()
 
-    def _principal_org_id():
-        # aws:PrincipalOrgID — the caller account's Organization, when it has
-        # one. In this emulator's model every account is the master of its own
-        # org the moment it calls Organizations, so the id resolves from the
-        # caller's own scope.
-        try:
-            from ministack.services import organizations as org_svc
-            org = org_svc._orgs.get("self")
-            return org.get("Id") if org else None
-        except Exception:
-            return None
-
     if _is_root_key(access_key_id):
         return {
             "accessKey": access_key_id,
             "accountId": account_id,
             "userArn": f"arn:aws:iam::{account_id}:root",
             "userId": account_id,
-            "principalOrgId": _principal_org_id(),
+            "principalOrgId": _principal_org_id(account_id),
             "session": None,
         }
     session = sts_svc._sessions.get(access_key_id)
@@ -965,7 +1017,7 @@ def resolve_caller_identity(access_key_id: str) -> dict | None:
             "accountId": account_id,
             "userArn": session.get("Arn", ""),
             "userId": session.get("UserId", ""),
-            "principalOrgId": _principal_org_id(),
+            "principalOrgId": _principal_org_id(account_id),
             "session": session,
         }
     key_record = iam_svc._access_keys.get_scoped(account_id, None, access_key_id)
@@ -977,7 +1029,7 @@ def resolve_caller_identity(access_key_id: str) -> dict | None:
             "accountId": account_id,
             "userArn": user.get("Arn") or f"arn:aws:iam::{account_id}:user/{user_name}",
             "userId": user.get("UserId", ""),
-            "principalOrgId": _principal_org_id(),
+            "principalOrgId": _principal_org_id(account_id),
             "session": None,
         }
     return None

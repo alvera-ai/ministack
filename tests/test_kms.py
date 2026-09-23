@@ -1,4 +1,5 @@
 import base64
+import datetime as _dt
 import json
 import os
 import time
@@ -794,7 +795,7 @@ def test_kms_restore_legacy_account_scoped_state_adopts_key_arn_region():
     try:
         set_request_account_id(account_id)
         set_request_region("us-east-1")
-        _kms.restore_state({"keys": legacy_keys, "aliases": legacy_aliases})
+        _kms.load_persisted_state({"keys": legacy_keys, "aliases": legacy_aliases})
 
         assert _kms._keys.get_scoped(account_id, "us-east-1", key_id) is None
         assert _kms._keys.get_scoped(account_id, "us-west-2", key_id)["Arn"] == key_arn
@@ -849,7 +850,7 @@ def test_kms_restore_legacy_bare_alias_name_adopts_target_key_region():
     try:
         set_request_account_id(account_id)
         set_request_region("us-east-1")
-        _kms.restore_state({"keys": legacy_keys, "aliases": legacy_aliases})
+        _kms.load_persisted_state({"keys": legacy_keys, "aliases": legacy_aliases})
 
         assert _kms._aliases.get_scoped(account_id, "us-east-1", alias_arn) is None
         assert _kms._aliases.get_scoped(account_id, "us-west-2", alias_arn) == key_id
@@ -1920,7 +1921,7 @@ def test_kms_hmac_key_survives_state_roundtrip():
         assert "_hmac_key_b64" in state["keys"][key_id]
         assert "_hmac_key" not in state["keys"][key_id]
         _kms.reset()
-        _kms.restore_state(state)
+        _kms.load_persisted_state(state)
 
         rec = _kms._keys[key_id]
         assert isinstance(rec["_hmac_key"], bytes)
@@ -2128,3 +2129,295 @@ def test_kms_primary_with_replicas_waits_on_deletion():
 
     west.schedule_key_deletion(KeyId=key_id, PendingWindowInDays=7)
     assert east.describe_key(KeyId=key_id)["KeyMetadata"]["KeyState"] == "PendingDeletion"
+
+
+# ---------------------------------------------------------------------------
+# Imported key material (BYOK): Origin EXTERNAL, GetParametersForImport,
+# ImportKeyMaterial, DeleteImportedKeyMaterial.
+# ---------------------------------------------------------------------------
+
+_BYOK_MATERIAL = bytes(range(32))
+_NO_EXPIRY = "KEY_MATERIAL_DOES_NOT_EXPIRE"
+
+
+def _wrap_material(public_key_der, algorithm, material=_BYOK_MATERIAL):
+    """Wrap key material the way a caller does, per WrappingAlgorithm."""
+    keywrap = pytest.importorskip("cryptography.hazmat.primitives.keywrap")
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import padding
+
+    public_key = serialization.load_der_public_key(public_key_der)
+    if algorithm == "RSAES_PKCS1_V1_5":
+        return public_key.encrypt(material, padding.PKCS1v15())
+    digest = hashes.SHA1() if algorithm.endswith("SHA_1") else hashes.SHA256()
+    oaep = padding.OAEP(mgf=padding.MGF1(algorithm=digest), algorithm=digest, label=None)
+    if algorithm.startswith("RSAES_OAEP"):
+        return public_key.encrypt(material, oaep)
+    ephemeral = os.urandom(32)
+    return (public_key.encrypt(ephemeral, oaep)
+            + keywrap.aes_key_wrap_with_padding(ephemeral, material))
+
+
+def _import_external_key(kms, algorithm="RSAES_OAEP_SHA_256", material=_BYOK_MATERIAL,
+                         expiration=_NO_EXPIRY, valid_to=None, **create_kwargs):
+    key_id = kms.create_key(Origin="EXTERNAL", **create_kwargs)["KeyMetadata"]["KeyId"]
+    params = kms.get_parameters_for_import(
+        KeyId=key_id, WrappingAlgorithm=algorithm, WrappingKeySpec="RSA_2048")
+    kwargs = {"ExpirationModel": expiration}
+    if valid_to is not None:
+        kwargs["ValidTo"] = valid_to
+    kms.import_key_material(
+        KeyId=key_id, ImportToken=params["ImportToken"],
+        EncryptedKeyMaterial=_wrap_material(params["PublicKey"], algorithm, material),
+        **kwargs)
+    return key_id, params
+
+
+def test_kms_external_key_starts_pending_import_and_refuses_use():
+    """An EXTERNAL key has no material until it is imported, so it starts
+    PendingImport and every cryptographic operation is refused."""
+    pytest.importorskip("cryptography")
+    kms = _regional_kms("us-east-1")
+    metadata = kms.create_key(Origin="EXTERNAL")["KeyMetadata"]
+    assert metadata["Origin"] == "EXTERNAL"
+    assert metadata["KeyState"] == "PendingImport"
+    assert metadata["Enabled"] is False
+    with pytest.raises(ClientError) as exc:
+        kms.encrypt(KeyId=metadata["KeyId"], Plaintext=b"x")
+    assert exc.value.response["Error"]["Code"] == "KMSInvalidStateException"
+
+
+@pytest.mark.parametrize("algorithm", [
+    "RSAES_PKCS1_V1_5", "RSAES_OAEP_SHA_1", "RSAES_OAEP_SHA_256",
+    "RSA_AES_KEY_WRAP_SHA_1", "RSA_AES_KEY_WRAP_SHA_256",
+])
+def test_kms_import_key_material_every_wrapping_algorithm(algorithm):
+    """Each WrappingAlgorithm in the enum unwraps, and the key then encrypts
+    and decrypts with the caller's own material."""
+    pytest.importorskip("cryptography")
+    kms = _regional_kms("us-east-1")
+    key_id, params = _import_external_key(kms, algorithm)
+    assert params["KeyId"].endswith(key_id)
+    assert params["ParametersValidTo"]
+    metadata = kms.describe_key(KeyId=key_id)["KeyMetadata"]
+    assert metadata["KeyState"] == "Enabled"
+    assert metadata["Enabled"] is True
+    assert metadata["ExpirationModel"] == _NO_EXPIRY
+    assert "ValidTo" not in metadata
+    ciphertext = kms.encrypt(KeyId=key_id, Plaintext=b"hello byok")["CiphertextBlob"]
+    assert kms.decrypt(CiphertextBlob=ciphertext)["Plaintext"] == b"hello byok"
+
+
+def test_kms_imported_material_is_the_callers_own_bytes():
+    """The point of BYOK: two keys given the same material are interchangeable,
+    so a fixture can pin the key bytes a test depends on."""
+    pytest.importorskip("cryptography")
+    kms = _regional_kms("us-east-1")
+    first, _ = _import_external_key(kms)
+    second, _ = _import_external_key(kms)
+    ciphertext = kms.encrypt(KeyId=first, Plaintext=b"same material")["CiphertextBlob"]
+    assert kms.decrypt(CiphertextBlob=ciphertext, KeyId=second)["Plaintext"] \
+        == b"same material"
+
+
+def test_kms_import_expiring_material_reports_valid_to():
+    pytest.importorskip("cryptography")
+    kms = _regional_kms("us-east-1")
+    valid_to = _dt.datetime(2030, 1, 1, tzinfo=_dt.timezone.utc)
+    key_id, _ = _import_external_key(
+        kms, expiration="KEY_MATERIAL_EXPIRES", valid_to=valid_to)
+    metadata = kms.describe_key(KeyId=key_id)["KeyMetadata"]
+    assert metadata["ExpirationModel"] == "KEY_MATERIAL_EXPIRES"
+    assert metadata["ValidTo"] == valid_to
+
+
+def test_kms_delete_imported_key_material_returns_the_key_to_pending_import():
+    pytest.importorskip("cryptography")
+    kms = _regional_kms("us-east-1")
+    key_id, _ = _import_external_key(kms)
+    kms.delete_imported_key_material(KeyId=key_id)
+    metadata = kms.describe_key(KeyId=key_id)["KeyMetadata"]
+    assert metadata["KeyState"] == "PendingImport"
+    assert metadata["Enabled"] is False
+    assert "ValidTo" not in metadata
+    with pytest.raises(ClientError) as exc:
+        kms.encrypt(KeyId=key_id, Plaintext=b"x")
+    assert exc.value.response["Error"]["Code"] == "KMSInvalidStateException"
+
+
+def test_kms_import_rejects_a_bad_token_wrong_material_and_reuse():
+    pytest.importorskip("cryptography")
+    kms = _regional_kms("us-east-1")
+    key_id = kms.create_key(Origin="EXTERNAL")["KeyMetadata"]["KeyId"]
+    params = kms.get_parameters_for_import(
+        KeyId=key_id, WrappingAlgorithm="RSAES_OAEP_SHA_256",
+        WrappingKeySpec="RSA_2048")
+    wrapped = _wrap_material(params["PublicKey"], "RSAES_OAEP_SHA_256")
+
+    def fails_with(code, **kwargs):
+        with pytest.raises(ClientError) as exc:
+            kms.import_key_material(KeyId=key_id, ExpirationModel=_NO_EXPIRY, **kwargs)
+        assert exc.value.response["Error"]["Code"] == code
+
+    fails_with("InvalidImportTokenException",
+               ImportToken=b"nope", EncryptedKeyMaterial=wrapped)
+    fails_with("InvalidCiphertextException",
+               ImportToken=params["ImportToken"], EncryptedKeyMaterial=b"x" * 256)
+    fails_with("IncorrectKeyMaterialException",
+               ImportToken=params["ImportToken"],
+               EncryptedKeyMaterial=_wrap_material(
+                   params["PublicKey"], "RSAES_OAEP_SHA_256", b"tooshort"))
+    # ValidTo is required when the material expires.
+    with pytest.raises(ClientError) as exc:
+        kms.import_key_material(
+            KeyId=key_id, ImportToken=params["ImportToken"],
+            EncryptedKeyMaterial=wrapped, ExpirationModel="KEY_MATERIAL_EXPIRES")
+    assert exc.value.response["Error"]["Code"] == "ValidationException"
+
+    kms.import_key_material(
+        KeyId=key_id, ImportToken=params["ImportToken"],
+        EncryptedKeyMaterial=wrapped, ExpirationModel=_NO_EXPIRY)
+    # The token is single-use.
+    fails_with("InvalidImportTokenException",
+               ImportToken=params["ImportToken"], EncryptedKeyMaterial=wrapped)
+
+
+def test_kms_import_flow_refuses_a_non_external_key():
+    """GetParametersForImport, ImportKeyMaterial and DeleteImportedKeyMaterial
+    all require Origin EXTERNAL."""
+    pytest.importorskip("cryptography")
+    kms = _regional_kms("us-east-1")
+    key_id = kms.create_key()["KeyMetadata"]["KeyId"]
+    with pytest.raises(ClientError) as exc:
+        kms.get_parameters_for_import(
+            KeyId=key_id, WrappingAlgorithm="RSAES_OAEP_SHA_256",
+            WrappingKeySpec="RSA_2048")
+    assert exc.value.response["Error"]["Code"] == "UnsupportedOperationException"
+    with pytest.raises(ClientError) as exc:
+        kms.delete_imported_key_material(KeyId=key_id)
+    assert exc.value.response["Error"]["Code"] == "UnsupportedOperationException"
+
+
+def test_kms_external_origin_wrapping_key_specs_are_validated():
+    pytest.importorskip("cryptography")
+    kms = _regional_kms("us-east-1")
+    key_id = kms.create_key(Origin="EXTERNAL")["KeyMetadata"]["KeyId"]
+    with pytest.raises(ClientError) as exc:
+        kms.get_parameters_for_import(
+            KeyId=key_id, WrappingAlgorithm="RSAES_OAEP_SHA_256",
+            WrappingKeySpec="SM2")
+    assert exc.value.response["Error"]["Code"] == "UnsupportedOperationException"
+
+
+def _pkcs8_der(private_key):
+    """The private key alone, DER-encoded PKCS#8, which is the form AWS imports."""
+    from cryptography.hazmat.primitives import serialization
+    return private_key.private_bytes(
+        serialization.Encoding.DER,
+        serialization.PrivateFormat.PKCS8,
+        serialization.NoEncryption(),
+    )
+
+
+def test_kms_external_hmac_key_imports_its_own_material():
+    """AWS supports imported key material for HMAC keys, and the imported bytes
+    are the ones the MAC is computed with."""
+    pytest.importorskip("cryptography")
+    import hashlib
+    import hmac
+    kms = _regional_kms("us-east-1")
+    material = bytes(range(32))
+    key_id, _ = _import_external_key(
+        kms, algorithm="RSAES_OAEP_SHA_256", material=material,
+        KeySpec="HMAC_256", KeyUsage="GENERATE_VERIFY_MAC")
+    metadata = kms.describe_key(KeyId=key_id)["KeyMetadata"]
+    assert metadata["KeyState"] == "Enabled"
+    assert metadata["Origin"] == "EXTERNAL"
+    mac = kms.generate_mac(KeyId=key_id, Message=b"hmac byok",
+                           MacAlgorithm="HMAC_SHA_256")["Mac"]
+    assert hmac.new(material, b"hmac byok", hashlib.sha256).digest() == mac
+
+
+@pytest.mark.parametrize("key_spec", [
+    "RSA_2048", "ECC_NIST_P256", "ECC_NIST_EDWARDS25519",
+])
+def test_kms_external_asymmetric_key_imports_its_own_private_key(key_spec):
+    """AWS imports the private key alone and derives the public key from it, so
+    GetPublicKey returns the pair of the material the caller supplied."""
+    pytest.importorskip("cryptography")
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import ec, ed25519, rsa
+    kms = _regional_kms("us-east-1")
+    if key_spec == "RSA_2048":
+        private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    elif key_spec == "ECC_NIST_P256":
+        private_key = ec.generate_private_key(ec.SECP256R1())
+    else:
+        private_key = ed25519.Ed25519PrivateKey.generate()
+    # A private key is far larger than RSAES_OAEP can wrap directly, so
+    # asymmetric material travels under the AES key-wrap algorithms.
+    key_id, _ = _import_external_key(
+        kms, algorithm="RSA_AES_KEY_WRAP_SHA_256", material=_pkcs8_der(private_key),
+        KeySpec=key_spec, KeyUsage="SIGN_VERIFY")
+    assert kms.describe_key(KeyId=key_id)["KeyMetadata"]["KeyState"] == "Enabled"
+    assert kms.get_public_key(KeyId=key_id)["PublicKey"] == \
+        private_key.public_key().public_bytes(
+            serialization.Encoding.DER,
+            serialization.PublicFormat.SubjectPublicKeyInfo)
+
+
+def test_kms_imported_asymmetric_key_signs_with_the_imported_material():
+    pytest.importorskip("cryptography")
+    from cryptography.hazmat.primitives.asymmetric import ec
+    kms = _regional_kms("us-east-1")
+    private_key = ec.generate_private_key(ec.SECP256R1())
+    key_id, _ = _import_external_key(
+        kms, algorithm="RSA_AES_KEY_WRAP_SHA_256", material=_pkcs8_der(private_key),
+        KeySpec="ECC_NIST_P256", KeyUsage="SIGN_VERIFY")
+    signature = kms.sign(KeyId=key_id, Message=b"sign byok",
+                         SigningAlgorithm="ECDSA_SHA_256")["Signature"]
+    assert kms.verify(KeyId=key_id, Message=b"sign byok", Signature=signature,
+                      SigningAlgorithm="ECDSA_SHA_256")["SignatureValid"] is True
+
+
+@pytest.mark.parametrize("key_spec,key_usage,material", [
+    ("HMAC_256", "GENERATE_VERIFY_MAC", bytes(16)),
+    ("ECC_NIST_P256", "SIGN_VERIFY", b"not a der private key"),
+])
+def test_kms_import_rejects_material_that_does_not_fit_the_key_spec(
+        key_spec, key_usage, material):
+    pytest.importorskip("cryptography")
+    kms = _regional_kms("us-east-1")
+    with pytest.raises(ClientError) as exc:
+        _import_external_key(
+            kms, algorithm="RSA_AES_KEY_WRAP_SHA_256", material=material,
+            KeySpec=key_spec, KeyUsage=key_usage)
+    assert exc.value.response["Error"]["Code"] == "IncorrectKeyMaterialException"
+
+
+def test_kms_import_rejects_a_private_key_of_the_wrong_curve():
+    """The material must be the key the KeySpec declares, not merely parseable."""
+    pytest.importorskip("cryptography")
+    from cryptography.hazmat.primitives.asymmetric import ec
+    kms = _regional_kms("us-east-1")
+    with pytest.raises(ClientError) as exc:
+        _import_external_key(
+            kms, algorithm="RSA_AES_KEY_WRAP_SHA_256",
+            material=_pkcs8_der(ec.generate_private_key(ec.SECP384R1())),
+            KeySpec="ECC_NIST_P256", KeyUsage="SIGN_VERIFY")
+    assert exc.value.response["Error"]["Code"] == "IncorrectKeyMaterialException"
+
+
+def test_kms_delete_imported_material_clears_the_asymmetric_key():
+    pytest.importorskip("cryptography")
+    from cryptography.hazmat.primitives.asymmetric import ec
+    kms = _regional_kms("us-east-1")
+    key_id, _ = _import_external_key(
+        kms, algorithm="RSA_AES_KEY_WRAP_SHA_256",
+        material=_pkcs8_der(ec.generate_private_key(ec.SECP256R1())),
+        KeySpec="ECC_NIST_P256", KeyUsage="SIGN_VERIFY")
+    kms.delete_imported_key_material(KeyId=key_id)
+    assert kms.describe_key(KeyId=key_id)["KeyMetadata"]["KeyState"] == "PendingImport"
+    with pytest.raises(ClientError) as exc:
+        kms.get_public_key(KeyId=key_id)
+    assert exc.value.response["Error"]["Code"] == "KMSInvalidStateException"

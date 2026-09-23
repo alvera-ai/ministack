@@ -39,7 +39,6 @@ from urllib.parse import parse_qs, urlparse
 from xml.sax.saxutils import escape as _esc
 
 from ministack.core.arn import ArnParseError, parse_arn
-from ministack.core.persistence import load_state
 from ministack.core.responses import AccountRegionScopedDict, get_account_id, get_region, new_uuid
 
 logger = logging.getLogger("sqs")
@@ -70,7 +69,11 @@ def get_state():
     }
 
 
-def restore_state(data):
+def load_persisted_state(data):
+    return _restore_state(data)
+
+
+def _restore_state(data):
     if data:
         _queues.update(data.get("queues", {}))
         _queue_name_to_url.clear()
@@ -237,21 +240,6 @@ def _rebuild_queue_name_index() -> None:
         _queue_name_to_url.set_scoped(account_id, region, name, url)
 
 
-# Import-time state restore. MUST run after restore_state AND every symbol it
-# references (here _rebuild_queue_name_index, defined just above) are bound —
-# otherwise the import-time call NameErrors, the bare except swallows it, and all
-# persisted SQS state is silently dropped on restart (the #492/#494 pattern).
-try:
-    _restored = load_state("sqs")
-    if _restored:
-        restore_state(_restored)
-except Exception:
-    import logging
-    logging.getLogger(__name__).exception(
-        "Failed to restore persisted state; continuing with fresh store"
-    )
-
-
 # ────────────────────────────────────────────────────────────
 #  ENTRY POINT
 # ────────────────────────────────────────────────────────────
@@ -378,7 +366,7 @@ def _validate_redrive_policy(rp_str: str) -> None:
 # CreateQueue/SetQueueAttributes time with InvalidAttributeValue (400).
 _NUMERIC_ATTR_RANGES = {
     "VisibilityTimeout":            (0, 43200),       # 0 .. 12 h
-    "MaximumMessageSize":           (1024, 262144),   # 1 KB .. 256 KB
+    "MaximumMessageSize":           (1024, 1048576),  # 1 KiB .. 1 MiB (captured default)
     "MessageRetentionPeriod":       (60, 1209600),    # 1 min .. 14 days
     "DelaySeconds":                 (0, 900),         # 0 .. 15 min
     "ReceiveMessageWaitTimeSeconds":(0, 20),          # 0 .. 20 s
@@ -440,7 +428,7 @@ def _act_create_queue(data: dict, _u: str) -> dict:
             "CreatedTimestamp": ts,
             "LastModifiedTimestamp": ts,
             "VisibilityTimeout": "30",
-            "MaximumMessageSize": "262144",
+            "MaximumMessageSize": "1048576",
             "MessageRetentionPeriod": "345600",
             "DelaySeconds": "0",
             "ReceiveMessageWaitTimeSeconds": "0",
@@ -521,12 +509,12 @@ def _act_send_message(data: dict, qurl: str) -> dict:
         )
 
     # AWS SQS rejects messages exceeding the queue's MaximumMessageSize attribute
-    # (default 262144 bytes; configurable up to 1 MiB / 1048576). Real AWS error
+    # (default 1048576 bytes / 1 MiB, captured eu-north-1 2026-09-19). Real AWS error
     # is InvalidParameterValue (400) with the queue-configured limit in the message.
     try:
-        max_size = int(q["attributes"].get("MaximumMessageSize", "262144"))
+        max_size = int(q["attributes"].get("MaximumMessageSize", "1048576"))
     except (TypeError, ValueError):
-        max_size = 262144
+        max_size = 1048576
     body_bytes = len(body_text.encode("utf-8"))
     if body_bytes > max_size:
         raise _Err(
@@ -714,14 +702,55 @@ def _act_change_visibility(data: dict, qurl: str) -> dict:
     return {}
 
 
+# ── Batch request validation ───────────────────────────────
+
+_BATCH_MAX_ENTRIES = 10
+_BATCH_ENTRY_ID_MAX_LENGTH = 80
+_BATCH_ENTRY_ID_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+
+
+def _validate_batch_entries(entries: list, entry_name: str) -> None:
+    """Run the checks AWS applies to a batch request before it looks at any entry.
+
+    Each of these fails the whole request rather than a single entry, which is what
+    separates them from the per-entry results the batch actions return. The codes are
+    the JSON protocol shape names; _QUERY_COMPAT_CODES already carries their legacy
+    Query spellings, so callers see AWS.SimpleQueueService.EmptyBatchRequest and the
+    rest. SendMessageBatch, DeleteMessageBatch and ChangeMessageVisibilityBatch each
+    declare all four in the SQS model.
+    See https://docs.aws.amazon.com/AWSSimpleQueueService/latest/APIReference/API_SendMessageBatch.html
+    """
+    if not entries:
+        raise _Err("EmptyBatchRequest",
+                   f"There should be at least one {entry_name} in the request.")
+
+    if len(entries) > _BATCH_MAX_ENTRIES:
+        raise _Err("TooManyEntriesInBatchRequest",
+                   "Too many messages in a batch request. A maximum of 10 messages are allowed.")
+
+    seen: set = set()
+    for entry in entries:
+        entry_id = entry.get("Id") or ""
+        if (len(entry_id) > _BATCH_ENTRY_ID_MAX_LENGTH
+                or not _BATCH_ENTRY_ID_RE.match(entry_id)):
+            raise _Err("InvalidBatchEntryId",
+                       "A batch entry id can only contain alphanumeric characters, "
+                       "hyphens and underscores. It can be at most 80 letters long.")
+        if entry_id in seen:
+            raise _Err("BatchEntryIdsNotDistinct", f"Id {entry_id} repeated.")
+        seen.add(entry_id)
+
+
 # ── ChangeMessageVisibilityBatch ───────────────────────────
 
 def _act_change_visibility_batch(data: dict, qurl: str) -> dict:
     url = data.get("QueueUrl", qurl)
     q = _get_q(url)
+    entries = data.get("Entries", [])
+    _validate_batch_entries(entries, "ChangeMessageVisibilityBatchRequestEntry")
     ok: list = []
     fail: list = []
-    for e in data.get("Entries", []):
+    for e in entries:
         eid = e.get("Id", "")
         rh = e.get("ReceiptHandle", "")
         vt = int(e.get("VisibilityTimeout", 30))
@@ -884,9 +913,7 @@ def _act_send_message_batch(data: dict, qurl: str) -> dict:
     url = data.get("QueueUrl", qurl)
     _get_q(url)
     entries = data.get("Entries", [])
-    if len(entries) > 10:
-        raise _Err("TooManyEntriesInBatchRequest",
-                   "Too many messages in a batch request. A maximum of 10 messages are allowed.")
+    _validate_batch_entries(entries, "SendMessageBatchRequestEntry")
 
     # AWS rule: "The maximum allowed individual message size and the maximum
     # total payload size (the sum of the individual lengths of all of the
@@ -931,9 +958,11 @@ def _act_send_message_batch(data: dict, qurl: str) -> dict:
 def _act_delete_message_batch(data: dict, qurl: str) -> dict:
     url = data.get("QueueUrl", qurl)
     q = _get_q(url)
+    entries = data.get("Entries", [])
+    _validate_batch_entries(entries, "DeleteMessageBatchRequestEntry")
     ok: list = []
     fail: list = []
-    for e in data.get("Entries", []):
+    for e in entries:
         eid = e.get("Id", "")
         rh = e.get("ReceiptHandle", "")
         before = len(q["messages"])

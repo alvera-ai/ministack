@@ -22,15 +22,14 @@ against botocore ``bedrock-agentcore-control`` / ``bedrock-agentcore``
 service-2.json.
 """
 import copy
+import datetime
 import json
 import logging
 import re
 import secrets
 import string
-import time
 from urllib.parse import unquote
 
-from ministack.core.persistence import load_state
 from ministack.core.responses import (
     AccountRegionScopedDict,
     error_response_json,
@@ -38,6 +37,7 @@ from ministack.core.responses import (
     get_region,
     json_response,
     new_uuid,
+    now_iso,
 )
 
 logger = logging.getLogger("bedrock_agentcore")
@@ -58,7 +58,11 @@ def get_state():
     return copy.deepcopy({"runtimes": _runtimes, "endpoints": _endpoints})
 
 
-def restore_state(data):
+def load_persisted_state(data):
+    return _restore_state(data)
+
+
+def _restore_state(data):
     if not data:
         return
     _runtimes.clear()
@@ -67,12 +71,6 @@ def restore_state(data):
     _endpoints.update(data.get("endpoints", {}))
 
 
-try:
-    _persisted = load_state("bedrock_agentcore")
-    if _persisted:
-        restore_state(_persisted)
-except Exception:  # pragma: no cover - best-effort restore
-    pass
 
 
 def reset():
@@ -107,6 +105,17 @@ def _endpoint_arn(endpoint_uuid: str) -> str:
 def _workload_identity_arn(name: str) -> str:
     return (f"arn:aws:bedrock-agentcore:{get_region()}:{get_account_id()}:"
             f"workload-identity-directory/default/workload-identity/{name}")
+
+
+def _iso(value):
+    """Every timestamp this service answers is the model's DateTimestamp, which
+    carries timestampFormat iso8601 -- an RFC 3339 string, not an epoch number.
+    Records persisted before this took epoch floats, so those are converted on
+    the way out."""
+    if isinstance(value, (int, float)):
+        return (datetime.datetime.fromtimestamp(value, datetime.timezone.utc)
+                .strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z")
+    return value
 
 
 def _validation(message: str):
@@ -148,7 +157,7 @@ def _create_agent_runtime(body):
     runtime_uuid = new_uuid()
     runtime_id = _resource_id(name)
     version = "1"
-    now = time.time()
+    now = now_iso()
     arn = _runtime_arn(runtime_uuid, version)
     workload = {"workloadIdentityArn": _workload_identity_arn(name)}
     record = {
@@ -202,7 +211,7 @@ def _list_agent_runtimes(body):
             "agentRuntimeVersion": r["agentRuntimeVersion"],
             "agentRuntimeName": r["agentRuntimeName"],
             "description": r.get("description", ""),
-            "lastUpdatedAt": r["lastUpdatedAt"],
+            "lastUpdatedAt": _iso(r["lastUpdatedAt"]),
             "status": r["status"],
         })
     return json_response({"agentRuntimes": summaries})
@@ -218,7 +227,7 @@ def _list_agent_runtime_versions(runtime_id, body):
         "agentRuntimeVersion": record["agentRuntimeVersion"],
         "agentRuntimeName": record["agentRuntimeName"],
         "description": record.get("description", ""),
-        "lastUpdatedAt": record["lastUpdatedAt"],
+        "lastUpdatedAt": _iso(record["lastUpdatedAt"]),
         "status": record["status"],
     }
     return json_response({"agentRuntimes": [summary]})
@@ -232,7 +241,7 @@ def _update_agent_runtime(runtime_id, body):
     for field in ("agentRuntimeArtifact", "roleArn", "networkConfiguration"):
         if not data.get(field):
             return _validation(f"{field} is required")
-    now = time.time()
+    now = now_iso()
     new_version = str(int(record["agentRuntimeVersion"]) + 1)
     record["agentRuntimeVersion"] = new_version
     record["agentRuntimeArn"] = _runtime_arn(record["_uuid"], new_version)
@@ -251,7 +260,7 @@ def _update_agent_runtime(runtime_id, body):
         "agentRuntimeId": runtime_id,
         "workloadIdentityDetails": record.get("workloadIdentityDetails"),
         "agentRuntimeVersion": new_version,
-        "createdAt": record["createdAt"],
+        "createdAt": _iso(record["createdAt"]),
         "lastUpdatedAt": now,
         "status": "UPDATING",
     })
@@ -283,7 +292,7 @@ def _create_agent_runtime_endpoint(runtime_id, body):
         return _conflict(f"Endpoint {name} already exists")
     target_version = data.get("agentRuntimeVersion") or runtime["agentRuntimeVersion"]
     endpoint_uuid = new_uuid()
-    now = time.time()
+    now = now_iso()
     record = {
         "name": name,
         "id": _resource_id(name),
@@ -319,8 +328,8 @@ def _get_agent_runtime_endpoint(runtime_id, endpoint_name):
         "agentRuntimeArn": record["agentRuntimeArn"],
         "description": record.get("description", ""),
         "status": record["status"],
-        "createdAt": record["createdAt"],
-        "lastUpdatedAt": record["lastUpdatedAt"],
+        "createdAt": _iso(record["createdAt"]),
+        "lastUpdatedAt": _iso(record["lastUpdatedAt"]),
         "name": record["name"],
         "id": record["id"],
     })
@@ -341,8 +350,8 @@ def _list_agent_runtime_endpoints(runtime_id, body):
             "status": record["status"],
             "id": record["id"],
             "description": record.get("description", ""),
-            "createdAt": record["createdAt"],
-            "lastUpdatedAt": record["lastUpdatedAt"],
+            "createdAt": _iso(record["createdAt"]),
+            "lastUpdatedAt": _iso(record["lastUpdatedAt"]),
         })
     return json_response({"runtimeEndpoints": items})
 
@@ -355,7 +364,7 @@ def _update_agent_runtime_endpoint(runtime_id, endpoint_name, body):
     if record is None:
         return _not_found(f"Endpoint {endpoint_name} not found")
     data = _parse_body(body)
-    now = time.time()
+    now = now_iso()
     if data.get("agentRuntimeVersion"):
         record["targetVersion"] = data["agentRuntimeVersion"]
         record["liveVersion"] = data["agentRuntimeVersion"]
@@ -369,7 +378,7 @@ def _update_agent_runtime_endpoint(runtime_id, endpoint_name, body):
         "agentRuntimeEndpointArn": record["agentRuntimeEndpointArn"],
         "agentRuntimeArn": record["agentRuntimeArn"],
         "status": "UPDATING",
-        "createdAt": record["createdAt"],
+        "createdAt": _iso(record["createdAt"]),
         "lastUpdatedAt": now,
     })
 

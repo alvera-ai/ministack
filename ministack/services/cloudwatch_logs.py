@@ -48,7 +48,6 @@ logger = logging.getLogger("logs")
 
 REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 
-from ministack.core.persistence import load_state
 
 _log_groups = AccountRegionScopedDict()
 # group_name -> {
@@ -191,7 +190,11 @@ def _restore_queries(queries):
                 _queries.set_scoped(account_id, _query_restore_region(account_id, value), key, value)
 
 
-def restore_state(data):
+def load_persisted_state(data):
+    return _restore_state(data)
+
+
+def _restore_state(data):
     if data:
         _log_groups.update(data.get("log_groups", {}))
         _destinations.update(data.get("destinations", {}))
@@ -203,15 +206,6 @@ def restore_state(data):
         _deliveries.update(data.get("deliveries", {}))
 
 
-try:
-    _restored = load_state("cloudwatch_logs")
-    if _restored:
-        restore_state(_restored)
-except Exception:
-    import logging
-    logging.getLogger(__name__).exception(
-        "Failed to restore persisted state; continuing with fresh store"
-    )
 
 
 # ---------------------------------------------------------------------------

@@ -10,7 +10,7 @@ import logging
 from ministack.core.responses import get_account_id, get_region, new_uuid, now_iso
 
 from .engine import (
-    _apply_sam_transform_if_applicable,
+    _apply_transforms,
     _evaluate_conditions,
     _parse_template,
     _resolve_parameters,
@@ -198,7 +198,8 @@ def _create_change_set(params):
 
     try:
         template = sent = _parse_template(template_body)
-        template = _apply_sam_transform_if_applicable(template)
+        template = _apply_transforms(template, provided_params,
+                                     stack.get("_resolved_params", {}))
     except Exception as e:
         return _rejected(f"Template format error: {e}")
 
@@ -396,7 +397,7 @@ def _execute_change_set(params):
                       f"ChangeSet [{cs_name}] does not exist", 404)
 
     if cs["ExecutionStatus"] != "AVAILABLE":
-        return _error("InvalidChangeSetStatusException",
+        return _error("InvalidChangeSetStatus",
                       f"ChangeSet [{cs_name}] is in {cs['ExecutionStatus']} status")
 
     cs["ExecutionStatus"] = "EXECUTE_IN_PROGRESS"
