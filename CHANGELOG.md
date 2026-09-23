@@ -12,7 +12,6 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 - **ECS — `awslogs` container output reaches CloudWatch Logs** — a task definition's `awslogs` configuration was stored and ignored, so a Docker-backed `RunTask` container's output went nowhere. Lines now reach the configured group, on a stream named `<prefix>/<container>/<task-id>` or after the container id without a prefix, in `awslogs-region`. Contributed by @rszabo50.
 - **RDS — an internal broker answers IAM database authentication** — `POST /_ministack/rds/iam-auth` verifies a token against a process-local capability bound to one endpoint, so the MySQL plugin can decide a login. Capabilities are never persisted or issued over HTTP, and nothing calls the endpoint yet. Contributed by @Areson.
 
-
 ### Fixed
 
 - **EC2 — Elastic IP tags and IPv6 network ACL entries survive a read** — `DescribeAddresses` omitted EIP tags, so Terraform repeatedly planned `tags` and `tags_all`; network ACL entries always stored and returned an IPv4 CIDR, so an IPv6 rule was read back as a changed IPv4 rule on every plan. Tags and `Ipv6CidrBlock` now round-trip through the EC2 API. Reported by @edersonbrilhante.
